@@ -36,11 +36,11 @@ Each paper carries a substantial **"Development Plan for Prototype Agents"** app
                              ▼               ▼            ▼
         ┌────────────────────────────────────────────────────────────────┐
         │                Ferrous Bridge orchestration DAG                 │
-        │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
-        │  │ Phase A  │→ │ Phase B  │→ │ Phase C  │→ │ Six-rung │         │
-        │  │ Analyse  │  │ Translate│  │ Verify   │  │ ladder   │         │
-        │  │ A1·A2·A3 │  │ B1..B5   │  │ C1..C5   │  │ ⊑c⊑m⊑b⊑n⊑r⊑a       │
-        │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘         │
+        │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │
+        │  │ Phase A  │→ │ Phase B  │→ │ Phase C  │→ │ Six-rung       │  │
+        │  │ Analyse  │  │ Translate│  │ Verify   │  │ safety ladder  │  │
+        │  │ A1·A2·A3 │  │ B1..B5   │  │ C1..C5   │  │ (see below)    │  │
+        │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬───────────┘  │
         │       └──────┬──────┴──────┬──────┴──────┬──────┘               │
         │              ▼             ▼             ▼                      │
         │        Typed protobuf artifacts (CAB · OSG · RustUnit ...)      │
@@ -55,6 +55,21 @@ Each paper carries a substantial **"Development Plan for Prototype Agents"** app
 ```
 
 The supervisor is implemented as a Claude Code subagent (the same orchestration substrate this very repo was produced on). No fictional "RalphD" — only real, available tools.
+
+### Six-rung safety ladder
+
+Each rung is a refinement relation (⊑, LaTeX `\sqsubseteq`) the candidate `safe-libyaml` must satisfy against the original C `libyaml`:
+
+| Rung | Symbol | Check | Tool |
+|---|---|---|---|
+| 1. Compilation | ⊑<sub>compile</sub> | zero warnings | `rustc -D warnings` |
+| 2. Memory | ⊑<sub>memory</sub> | no UB on the test suite | `cargo +nightly miri test` |
+| 3. Behavioral | ⊑<sub>behav</sub> | identical event stream over fuzzed inputs | AFL++ / cargo-fuzz vs C libyaml |
+| 4. Concurrency | ⊑<sub>conc</sub> | shared-state code is sound | `cargo careful test` + Loom |
+| 5. Refinement | ⊑<sub>ref</sub> | bounded model checks on critical invariants | Kani / Creusot |
+| 6. ABI | ⊑<sub>abi</sub> | header diff is empty | `cbindgen` vs original `yaml.h` |
+
+A pipeline run that satisfies all six rungs constitutes the informal composition theorem stated in the synthesis paper.
 
 ---
 
