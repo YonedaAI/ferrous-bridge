@@ -54,8 +54,6 @@ Each paper carries a substantial **"Development Plan for Prototype Agents"** app
                                  (next: safe-libexpat)
 ```
 
-The supervisor is implemented as a Claude Code subagent (the same orchestration substrate this very repo was produced on). No fictional "RalphD" — only real, available tools.
-
 ### Six-rung safety ladder
 
 Each rung is a refinement relation (⊑, LaTeX `\sqsubseteq`) the candidate `safe-libyaml` must satisfy against the original C `libyaml`:
