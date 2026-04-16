@@ -1,0 +1,1058 @@
+<h1 data-number="1" id="sec:intro"><span class="header-section-number">1</span> Introduction</h1>
+<h2 data-number="1.1" id="what-safe-and-idiomatic-means-in-this-paper"><span class="header-section-number">1.1</span> What “safe and idiomatic” means in this paper</h2>
+<p>Rust’s marketing surface — “a systems language without the segfaults” —  underdetermines what “safe” means as an engineering target. We take three operational definitions throughout the paper.</p>
+<div id="def:safe-rust" class="definition">
+<p><strong>Definition 1</strong> (Safe Rust).  A Rust crate is <em>safe</em> if it contains no <code>unsafe</code> blocks outside of a thin, separately-versioned FFI boundary, and if its entire test suite passes under <em>Miri</em> <span class="citation" data-cites="miri-popl2026"></span> with zero undefined behaviour reports under the Stacked Borrows aliasing model.</p>
+</div>
+<div id="def:idiomatic-rust" class="definition">
+<p><strong>Definition 2</strong> (Idiomatic Rust).  A Rust crate is <em>idiomatic</em> if it (i) replaces every C-style integer error return with a <code>Result&lt;T,E&gt;</code>; (ii) replaces every nullable pointer with <code>Option&lt;T&gt;</code>; (iii) replaces every tagged union with an <code>enum</code> whose exhaustiveness is checked by the compiler; (iv) prefers iterator adaptors over manual index loops; and (v) passes <code>cargo clippy -- -W clippy::pedantic</code> with no allowed lints other than those documented in the crate’s lint policy.</p>
+</div>
+<div id="def:abi-compat" class="definition">
+<p><strong>Definition 3</strong> (ABI-compatible).  A Rust crate is <em>ABI-compatible</em> with a C library <span class="math inline">\(L\)</span> if it exports a set of <code>extern "C"</code> functions whose names, calling conventions, and <code>#[repr(C)]</code> struct layouts match <span class="math inline">\(L\)</span>’s public header file byte-for-byte as detected by <code>cbindgen</code> diff and by <code>nm</code> symbol enumeration.</p>
+</div>
+<p>The thesis of the paper is a <em>specification</em> thesis: all three properties should be simultaneously achievable for a non-trivial streaming parser, and the engineering rules that would make them achievable can be encoded as agent prompts and CI gates. We propose those rules concretely; the empirical verification that the in-progress <code>safe-libyaml</code> actually achieves them at parity with the C reference is the responsibility of the companion verification work and is not claimed here as a result.</p>
+<h2 data-number="1.2" id="safe-libyaml-as-the-running-example"><span class="header-section-number">1.2</span> <code>safe-libyaml</code> as the running example</h2>
+<p>The <code>libyaml</code> C library is a streaming YAML 1.1 parser/emitter of roughly 9<span>,</span>300 lines of source spread across ten files. The <code>unsafe-libyaml</code> crate<a href="#fn1" class="footnote-ref" id="fnref1" role="doc-noteref"><sup>1</sup></a> is a mechanical <code>c2rust</code> transpilation that retains the original C control flow but expresses it in pervasively-<code>unsafe</code> Rust; it has <span class="math inline">\(\approx 90\)</span>M cumulative downloads as the parser backend of <code>serde_yaml</code>, <code>serde_yaml_ng</code>, <code>serde_yaml_bw</code>, and <code>serde_norway</code>. The <code>libyaml-safer</code> crate<a href="#fn2" class="footnote-ref" id="fnref2" role="doc-noteref"><sup>2</sup></a> is a one-week manual safe port by S. Ask that demonstrates the exercise is feasible by a skilled human, and which we use as a quality and performance reference. Our target crate <code>safe-libyaml</code> is the planned <em>automated</em> safe port produced by the <em>Ferrous Bridge</em> pipeline; this paper specifies its API surface and its agent build plan, but does not report measured properties of an implementation that does not yet exist. Numbers attributed to <code>libyaml-safer</code> are external results we cite; numbers attributed to <code>safe-libyaml</code> are explicit <em>targets</em> for the in-progress build.</p>
+<h2 data-number="1.3" id="outline"><span class="header-section-number">1.3</span> Outline</h2>
+<p>Section <a href="#sec:framework" data-reference-type="ref" data-reference="sec:framework">2</a> fixes notation (lifetime regions, the borrow judgment, the <code>Result</code>/<code>Option</code> algebra) as a clarity tool; it is not a new formal system. Section <a href="#sec:ownership-streaming" data-reference-type="ref" data-reference="sec:ownership-streaming">3</a> treats ownership and borrowing for streaming parsers; Section <a href="#sec:lifetimes-events" data-reference-type="ref" data-reference="sec:lifetimes-events">4</a> dives into the lifetime-parameterised <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> enum, the central design decision. Section <a href="#sec:errors" data-reference-type="ref" data-reference="sec:errors">5</a> addresses error handling; Section <a href="#sec:memory" data-reference-type="ref" data-reference="sec:memory">6</a> maps libyaml’s STACK/QUEUE/STRING macros to safe <code>std</code> types. Section <a href="#sec:nostd" data-reference-type="ref" data-reference="sec:nostd">7</a> discusses <code>no_std + alloc</code>. Section <a href="#sec:tagged-enums" data-reference-type="ref" data-reference="sec:tagged-enums">8</a> treats tagged unions vs. <code>enum</code>. Section <a href="#sec:unsafe" data-reference-type="ref" data-reference="sec:unsafe">9</a> formalises the <code>unsafe</code> discipline. Section <a href="#sec:ffi" data-reference-type="ref" data-reference="sec:ffi">10</a> specifies the <code>#[repr(C)]</code> ABI shim and <code>cbindgen</code> integration. Section <a href="#sec:tooling" data-reference-type="ref" data-reference="sec:tooling">11</a> surveys the quality-gate tools. Section <a href="#sec:related" data-reference-type="ref" data-reference="sec:related">12</a> situates the work alongside <code>nom</code>, <code>winnow</code>, <code>rustls</code>, <code>rav1d</code>, and others. Section <a href="#sec:results" data-reference-type="ref" data-reference="sec:results">13</a> states the safety results and Section <a href="#sec:disc" data-reference-type="ref" data-reference="sec:disc">14</a> discusses limitations. Section <a href="#sec:concl" data-reference-type="ref" data-reference="sec:concl">15</a> concludes. Appendix A is the mandatory <em>Development Plan for Prototype Agents</em> covering the scaffold and idiom phase.</p>
+<h1 data-number="2" id="sec:framework"><span class="header-section-number">2</span> Notation: A Lightweight Framework</h1>
+<p><em>What this section is and is not.</em> The fragment of formalism introduced below is a <em>notational tool</em>: it lets later sections state precisely which parts of the design are forced by Rust’s type system and which are engineering choices. We do not introduce any new formal system, nor do we prove any new property of Rust itself. Where Rust’s full type system has been formalised — most completely by the RustBelt project <span class="citation" data-cites="rustbelt"></span> — we cite their results rather than re-derive them. The notation is inspired by region-based memory management <span class="citation" data-cites="tofte-talpin"></span> and is adequate for the API-design statements that follow.</p>
+<h2 data-number="2.1" id="lifetimes-as-regions"><span class="header-section-number">2.1</span> Lifetimes as regions</h2>
+<div class="definition">
+<p><strong>Definition 4</strong> (Region).  A <em>region</em> (or <em>lifetime</em>) <span class="math inline">\(\rho \in \mathcal{R}\)</span> is an element of a partially-ordered set <span class="math inline">\((\mathcal{R}, \ensuremath{:})\)</span> where <span class="math inline">\(\rho_1 \ensuremath{:}\rho_2\)</span> (read “<span class="math inline">\(\rho_1\)</span> outlives <span class="math inline">\(\rho_2\)</span>”) means every program point at which a borrow with lifetime <span class="math inline">\(\rho_2\)</span> is live is dominated by a program point at which a borrow with lifetime <span class="math inline">\(\rho_1\)</span> is live. The Rust surface syntax writes <span class="math inline">\(\ensuremath{\,&#39;\!a} \ensuremath{:}\ensuremath{\,&#39;\!b}\)</span>.</p>
+</div>
+<div class="remark">
+<p><em>Remark 5</em> (Asymmetry of the colon).  The Rust syntax overloads “ : ” between type ascription (<span class="math inline">\(x : \tau\)</span>) and lifetime constraints (<span class="math inline">\(\ensuremath{\,&#39;\!a} : \ensuremath{\,&#39;\!b}\)</span>). We write  <span class="math inline">\(\ensuremath{:}\)</span>  for the latter throughout to avoid ambiguity.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 6</strong> (Static region).  The distinguished region <span class="math inline">\(\ensuremath{\,&#39;\!static} \in \mathcal{R}\)</span> satisfies <span class="math inline">\(\ensuremath{\,&#39;\!static} \ensuremath{:}\rho\)</span> for every <span class="math inline">\(\rho \in \mathcal{R}\)</span>. Values of type <span class="math inline">\(\ensuremath{\&amp;^{\ensuremath{\,&#39;\!static}}\,T}\)</span> are valid for the entire program execution.</p>
+</div>
+<h2 data-number="2.2" id="the-borrow-judgment"><span class="header-section-number">2.2</span> The borrow judgment</h2>
+<div class="definition">
+<p><strong>Definition 7</strong> (Typing context).  A typing context <span class="math inline">\(\Gamma\)</span> is a finite map from variables to pairs <span class="math inline">\((\tau, \rho)\)</span> where <span class="math inline">\(\tau\)</span> is a Rust type and <span class="math inline">\(\rho\)</span> is the region during which the binding is live. We write <span class="math inline">\(\Gamma, x : \tau \langle \rho \rangle\)</span> for the extension.</p>
+</div>
+<p>The borrow checker can be presented as a judgment <span class="math inline">\(\ensuremath{\Gamma \vdash e : \tau \langle \rho \rangle}\)</span>, read “in context <span class="math inline">\(\Gamma\)</span>, expression <span class="math inline">\(e\)</span> has type <span class="math inline">\(\tau\)</span> valid in region <span class="math inline">\(\rho\)</span>”. Three rules suffice for our purposes. <em>Notational bridge:</em> the formal <span class="math inline">\(\ensuremath{\&amp;^{\rho}\,T}\)</span> in this section corresponds to Rust’s surface syntax <code>&amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> T</code> (reading <span class="math inline">\(\rho\)</span> as <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span>); <span class="math inline">\(\ensuremath{\&amp;\mathsf{mut}\;T}\)</span> corresponds to <code>&amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> mut T</code>. The remainder of the paper uses the Rust surface syntax exclusively; the formal notation appears only in this section and in the proofs of Propositions <a href="#prop:contravariance" data-reference-type="ref" data-reference="prop:contravariance">8</a>, <a href="#prop:cow-events" data-reference-type="ref" data-reference="prop:cow-events">12</a>, and <a href="#prop:compositional-safety" data-reference-type="ref" data-reference="prop:compositional-safety">17</a>.</p>
+<div class="mathpar">
+<p><span> <span class="math inline">\(\Gamma \vdash x : \tau \langle \rho \rangle\)</span> </span></p>
+<p><span> <span class="math inline">\(\Gamma \vdash \&amp;\, e : \ensuremath{\&amp;^{\rho&#39;}\,\tau} \langle \rho&#39; \rangle\)</span> </span></p>
+<p><span> <span class="math inline">\(\Gamma \vdash e : \tau \langle \rho&#39; \rangle\)</span> </span></p>
+</div>
+<div id="prop:contravariance" class="proposition">
+<p><strong>Proposition 8</strong> (Variance of borrow types).  <em><em>Shared</em> borrows are <em>covariant</em> in their lifetime parameter: if <span class="math inline">\(\rho_1 \ensuremath{:}\rho_2\)</span> then <span class="math inline">\(\ensuremath{\&amp;^{\rho_1}\,\tau} \ensuremath{&lt;:}\ensuremath{\&amp;^{\rho_2}\,\tau}\)</span>. <em>Mutable</em> borrows are <em>invariant</em> in their lifetime parameter: if <span class="math inline">\(\ensuremath{\&amp;^{\rho_1}\,\mathsf{mut}\, \tau} \ensuremath{&lt;:}\ensuremath{\&amp;^{\rho_2}\,\mathsf{mut}\, \tau}\)</span> then <span class="math inline">\(\rho_1 = \rho_2\)</span>. The invariance of the mutable case arises because <span class="math inline">\(\&amp;\mathsf{mut}\,\tau\)</span> supports both reads (which would justify covariance) <em>and</em> writes (which, symmetrically, would justify contravariance); the conjunction of covariance and contravariance is invariance.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof sketch.</em> Subtype substitution must preserve typing in every position. For shared borrows, only the read position is exercised; a longer lifetime always admits the uses a shorter one would, hence covariance. For mutable borrows, the same reasoning gives covariance for the read position but contravariance for the write position: a write through a long-lived alias must be visible through every other alias of the same cell, so shrinking the lifetime in a write-reachable position is unsound. The conjunction of the two forces invariance. The full argument is RustBelt’s main soundness theorem <span class="citation" data-cites="rustbelt"></span>. ◻</p>
+</div>
+<h2 data-number="2.3" id="the-result-and-option-algebra"><span class="header-section-number">2.3</span> The Result and Option algebra</h2>
+<div class="definition">
+<p><strong>Definition 9</strong> (Sum-type error algebra).  For Rust types <span class="math inline">\(T, E\)</span> we have the sum types <span class="math display">\[\ensuremath{\mathsf{Result}\langle T,\,E\rangle} \;=\; \mathsf{Ok}(T) + \mathsf{Err}(E),
+\qquad
+\ensuremath{\mathsf{Option}\langle T\rangle} \;=\; \mathsf{Some}(T) + \mathsf{None}.\]</span> The  <code>?</code>  operator implements the Kleisli composition <span class="math inline">\(f \;\texttt{?}\; g : \ensuremath{\mathsf{Result}\langle T,\,E\rangle} \to \ensuremath{\mathsf{Result}\langle U,\,E\rangle}\)</span>, lifting  <span class="math inline">\(g : T \to \ensuremath{\mathsf{Result}\langle U,\,E\rangle}\)</span> across the error monad and short-circuiting on <span class="math inline">\(\mathsf{Err}\)</span>.</p>
+</div>
+<div id="thm:errors-compose" class="proposition">
+<p><strong>Proposition 10</strong> (Errors compose via <code>?</code>).  <em>Let <span class="math inline">\(f_1 : A \to \ensuremath{\mathsf{Result}\langle B,\,E_1\rangle}\)</span> and <span class="math inline">\(f_2 : B \to \ensuremath{\mathsf{Result}\langle C,\,E_2\rangle}\)</span>. If the crate’s error type <span class="math inline">\(E\)</span> satisfies both <span class="math inline">\(\mathsf{From}\langle E_1\rangle\)</span> and <span class="math inline">\(\mathsf{From}\langle E_2\rangle\)</span>, then the composition <span class="math inline">\(f_2 \circ f_1\)</span> has a canonical lift to <span class="math inline">\(A \to \ensuremath{\mathsf{Result}\langle C,\,E\rangle}\)</span> via the  <code>?</code>  operator alone:</em></p>
+<pre><code>fn compose(a: A) -&gt; Result&lt;C, E&gt; {
+    let b = f1(a)?;          // ? invokes E::from(E1)
+    let c = f2(b)?;          // ? invokes E::from(E2)
+    Ok(c)
+}</code></pre>
+<p><em>The  <code>?</code>  operator desugars to a match that invokes <code>E::from(e1)</code> (resp. <code>E::from(e2)</code>) on the <code>Err</code> branch, giving the uniform short-circuit on the error monad.</em></p>
+</div>
+<p>This is the formal justification for the <code>thiserror</code> pattern discussed in Section <a href="#sec:errors" data-reference-type="ref" data-reference="sec:errors">5</a>: deriving <code>#[from]</code> on each nested error arm installs the required <code>From</code> instance.</p>
+<h1 data-number="3" id="sec:ownership-streaming"><span class="header-section-number">3</span> Ownership and Borrowing for Streaming Parsers</h1>
+<p>A streaming parser sits at the intersection of three resource concerns: an <em>input buffer</em> that someone must own, an emitted <em>event stream</em> that must be either owned or borrowed back into the buffer, and an <em>internal state</em> (token queue, indent stack, mark stack) that is exclusively the parser’s. The C <code>libyaml</code> answer is to make every pointer raw; the safe-Rust answer is to assign each concern to exactly one of the four ownership classes.</p>
+<div id="def:ownership-class" class="definition">
+<p><strong>Definition 11</strong> (Pointer ownership classification).  For each C pointer <span class="math inline">\(p\)</span> in a function we assign one of:</p>
+<ul>
+<li><p><span class="sans-serif">Owning</span>: <span class="math inline">\(p\)</span> is allocated in the function and freed in the function (or returned to a caller who is responsible for freeing it). Rust target: <span class="math inline">\(\ensuremath{\mathsf{Box}\langle T\rangle}\)</span> or owned <span class="math inline">\(\ensuremath{\mathsf{Vec}\langle T\rangle}\)</span>.</p></li>
+<li><p><span class="sans-serif">BorrowShared</span>: <span class="math inline">\(p\)</span> is read but never written through and never freed. Rust target: <span class="math inline">\(\ensuremath{\&amp;^{\ensuremath{\,&#39;\!a}}\,T}\)</span> or <span class="math inline">\(\ensuremath{\&amp;^{\ensuremath{\,&#39;\!a}}\,\ensuremath{[\,T\,]}}\)</span>.</p></li>
+<li><p><span class="sans-serif">BorrowMut</span>: <span class="math inline">\(p\)</span> is written through but not freed. Rust target: <span class="math inline">\(\ensuremath{\&amp;\mathsf{mut}\;T}\)</span> or <span class="math inline">\(\ensuremath{\&amp;\mathsf{mut}\;\ensuremath{[\,T\,]}}\)</span>.</p></li>
+<li><p><span class="sans-serif">SharedOwnership</span>: <span class="math inline">\(p\)</span> is held by multiple owners with potentially overlapping lifetimes; Rust target: <span class="math inline">\(\mathsf{Rc}\langle T\rangle\)</span> or <span class="math inline">\(\mathsf{Arc}\langle T\rangle\)</span>.</p></li>
+</ul>
+</div>
+<p>For <code>libyaml</code>’s parser, the classification falls out cleanly: the input buffer is owned by the <code>Parser</code>; the token queue and the indent and mark stacks are owned by the <code>Parser</code>; the events emitted to the caller are either <em>borrowed</em> from the buffer (zero-copy, lifetime-parameterised), or <em>owned</em> (allocated string copies). This dichotomy is the central design tension addressed in Section <a href="#sec:lifetimes-events" data-reference-type="ref" data-reference="sec:lifetimes-events">4</a>.</p>
+<h2 data-number="3.1" id="the-single-owner-buffer"><span class="header-section-number">3.1</span> The single-owner buffer</h2>
+<p>The C <code>yaml_parser_set_input_string(parser, input, length)</code> accepts a <span class="math inline">\((\texttt{ptr},\texttt{len})\)</span> pair without specifying ownership. The Rust analogue must choose. We propose three constructors:</p>
+<pre><code>impl Parser {
+    /// Parse from a borrowed byte slice. The Parser borrows from `input`
+    /// for the lifetime of the Parser; events may borrow zero-copy.
+    pub fn from_slice&lt;&#39;a&gt;(input: &amp;&#39;a [u8]) -&gt; Parser&lt;&#39;a&gt;;
+
+    /// Parse from an owned byte vector. The Parser owns the buffer.
+    /// Events that need to borrow scalar text will copy or be `OwnedEvent`.
+    pub fn from_vec(input: Vec&lt;u8&gt;) -&gt; Parser&lt;&#39;static&gt;;
+
+    /// Parse from any reader. The Parser maintains its own internal buffer.
+    pub fn from_reader&lt;R: std::io::Read + &#39;static&gt;(r: R) -&gt; Parser&lt;&#39;static&gt;;
+}</code></pre>
+<p>The lifetime parameter on <code>Parser&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> expresses the zero-copy guarantee that an event borrowed from the parser cannot outlive the input. The reader-based constructor degenerates to <span class="math inline">\(\ensuremath{\,&#39;\!static}\)</span> because the parser owns the buffer.</p>
+<h2 data-number="3.2" id="the-zero-copy-u8-pattern"><span class="header-section-number">3.2</span> The zero-copy <code>&amp;[u8]</code> pattern</h2>
+<p>Several Rust parser ecosystems (<code>nom</code> <span class="citation" data-cites="nom"></span>, <code>winnow</code>, <code>httparse</code>, <code>serde_json</code>’s borrowed mode) standardise on the <code>&amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> [u8]</code> input pattern: the parser receives a borrowed byte slice and emits structured values that may borrow back into that same slice. This is the natural Rust expression of streaming parsing without allocation: the input lives at lifetime <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span>, every output node that is a substring of the input lives at the same <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span>, and the borrow checker statically prevents the slice from being freed while events that point into it are live.</p>
+<p>For YAML, this pattern is partially achievable: most plain scalars are substrings of the input, but escape-processed scalars (e.g. <code>"line\nbreak"</code>) require an owned <code>String</code> because the decoded form does not appear contiguously in the input. We handle this with the <code>Cow</code> pattern in the next section.</p>
+<h1 data-number="4" id="sec:lifetimes-events"><span class="header-section-number">4</span> Lifetimes for Event-Based APIs</h1>
+<h2 data-number="4.1" id="the-lifetime-parameterised-eventa"><span class="header-section-number">4.1</span> The lifetime-parameterised <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code></h2>
+<p>The central public type of <code>safe-libyaml</code> is the parser event enum. Its design is the most consequential decision in the crate; every downstream choice flows from it. We propose:</p>
+<pre><code>use std::borrow::Cow;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event&lt;&#39;a&gt; {
+    StreamStart {
+        encoding: Encoding,
+    },
+    StreamEnd,
+    DocumentStart {
+        version: Option&lt;VersionDirective&gt;,
+        tags: Vec&lt;TagDirective&lt;&#39;a&gt;&gt;,
+        implicit: bool,
+    },
+    DocumentEnd {
+        implicit: bool,
+    },
+    Alias {
+        anchor: Cow&lt;&#39;a, str&gt;,
+    },
+    Scalar {
+        anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        value:  Cow&lt;&#39;a, str&gt;,
+        plain_implicit: bool,
+        quoted_implicit: bool,
+        style:  ScalarStyle,
+    },
+    SequenceStart {
+        anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        implicit: bool,
+        style:  SequenceStyle,
+    },
+    SequenceEnd,
+    MappingStart {
+        anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+        implicit: bool,
+        style:  MappingStyle,
+    },
+    MappingEnd,
+}</code></pre>
+<p>The <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> (clone-on-write) type is the linchpin: it is either <code>Borrowed(&amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> str)</code> pointing into the input buffer, or <code>Owned(String)</code> when the parser had to decode an escape sequence. The borrow checker enforces that a <code>Borrowed</code> variant cannot outlive the input.</p>
+<div id="prop:cow-events" class="proposition">
+<p><strong>Proposition 12</strong> (Soundness of Cow-events).  <em>Suppose <code>Parser&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> borrows input <span class="math inline">\(b : \ensuremath{\&amp;^{\ensuremath{\,&#39;\!a}}\,\ensuremath{[\,u8\,]}}\)</span>, and <span class="math inline">\(\mathsf{parse}: \ensuremath{\&amp;\mathsf{mut}\;\mathsf{Parser}\langle\ensuremath{\,&#39;\!a}\rangle}
+\to \ensuremath{\mathsf{Result}\langle \mathsf{Event}\langle\ensuremath{\,&#39;\!a}\rangle,\,\mathsf{Error}\rangle}\)</span>. Then for any <span class="math inline">\(e : \mathsf{Event}\langle\ensuremath{\,&#39;\!a}\rangle\)</span> produced by <code>parse</code>, every <code>Cow::Borrowed(s)</code> sub-component of <span class="math inline">\(e\)</span> satisfies <span class="math inline">\(s : \ensuremath{\&amp;^{\ensuremath{\,&#39;\!a}}\,\mathsf{str}}\)</span>, hence the borrow checker prevents <span class="math inline">\(b\)</span> from being dropped while any such <span class="math inline">\(e\)</span> is live.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof sketch.</em> By the <span class="smallcaps">Borrow</span> and <span class="smallcaps">Sub</span> rules of Section <a href="#sec:framework" data-reference-type="ref" data-reference="sec:framework">2</a>, the lifetime <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span> on the input flows through the <code>Parser&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> type into the return type of <code>parse</code>. The <code>Cow</code> type is parameterised covariantly in <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span>, so <span class="math inline">\(\mathsf{Cow}\langle\ensuremath{\,&#39;\!a}\rangle \ensuremath{&lt;:}\mathsf{Cow}\langle\ensuremath{\,&#39;\!b}\rangle\)</span> whenever <span class="math inline">\(\ensuremath{\,&#39;\!a} \ensuremath{:}\ensuremath{\,&#39;\!b}\)</span>. The drop-check for <span class="math inline">\(b\)</span> fails if any reference parameterised by <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span> is live, by the NLL rules. ◻</p>
+</div>
+<h2 data-number="4.2" id="escape-hatches-ownedevent-and-the-borrow-vs-clone-tradeoff"><span class="header-section-number">4.2</span> Escape hatches: <code>OwnedEvent</code> and the borrow-vs-clone tradeoff</h2>
+<p>There are circumstances under which holding an event across calls to <code>parse</code> is desirable: a wrapper that buffers events for replay, a multi-threaded reader/parser pipeline, or a <code>serde</code>-style deserialiser that constructs a tree from the event stream. In these cases the lifetime parameter on <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> becomes a usability tax: every helper struct grows the lifetime parameter virally.</p>
+<p>The standard escape hatch is to provide a sibling <code>OwnedEvent</code> type with all <code>Cow</code>s collapsed to <code>String</code>, and a single conversion <code>Event::into_owned</code>. This pattern is the Rust analogue of the “borrow now, copy later if you want to escape” discipline.</p>
+<pre><code>#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEvent {
+    inner: Event&lt;&#39;static&gt;,  // Cow::Owned variants only
+}
+
+// Helper that lifts a Cow&lt;&#39;a, str&gt; into a Cow&lt;&#39;static, str&gt; by always cloning.
+#[inline]
+fn own(c: Cow&lt;&#39;_, str&gt;) -&gt; Cow&lt;&#39;static, str&gt; { Cow::Owned(c.into_owned()) }
+
+impl&lt;&#39;a&gt; Event&lt;&#39;a&gt; {
+    pub fn into_owned(self) -&gt; OwnedEvent {
+        let inner: Event&lt;&#39;static&gt; = match self {
+            Event::StreamStart { encoding } =&gt;
+                Event::StreamStart { encoding },
+            Event::StreamEnd =&gt;
+                Event::StreamEnd,
+            Event::DocumentStart { version, tags, implicit } =&gt;
+                Event::DocumentStart {
+                    version,
+                    tags: tags.into_iter()
+                        .map(|t| TagDirective { handle: own(t.handle),
+                                                prefix: own(t.prefix) })
+                        .collect(),
+                    implicit,
+                },
+            Event::DocumentEnd { implicit } =&gt;
+                Event::DocumentEnd { implicit },
+            Event::Alias { anchor } =&gt;
+                Event::Alias { anchor: own(anchor) },
+            Event::Scalar { anchor, tag, value,
+                            plain_implicit, quoted_implicit, style } =&gt;
+                Event::Scalar {
+                    anchor: anchor.map(own),
+                    tag:    tag.map(own),
+                    value:  own(value),
+                    plain_implicit, quoted_implicit, style,
+                },
+            Event::SequenceStart { anchor, tag, implicit, style } =&gt;
+                Event::SequenceStart {
+                    anchor: anchor.map(own), tag: tag.map(own),
+                    implicit, style,
+                },
+            Event::SequenceEnd =&gt;
+                Event::SequenceEnd,
+            Event::MappingStart { anchor, tag, implicit, style } =&gt;
+                Event::MappingStart {
+                    anchor: anchor.map(own), tag: tag.map(own),
+                    implicit, style,
+                },
+            Event::MappingEnd =&gt;
+                Event::MappingEnd,
+        };
+        OwnedEvent { inner }
+    }
+}</code></pre>
+<div id="rem:libyaml-safer" class="remark">
+<p><em>Remark 13</em> (The <code>libyaml-safer</code> insight).  The breakthrough of S. Ask’s <code>libyaml-safer</code> port was to recognise that the C <code>yaml_emitter_t</code> struct contains an internal analysis record (<code>yaml_scalar_analysis_t</code>) holding raw <code>char*</code> pointers back into the event being emitted. The naive Rust transcription is self-referential and impossible without <code>Pin</code>. The solution is to factor analysis into an <code>Analysis&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> struct that borrows from the <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> and is passed explicitly through emitter functions. The Rust borrow checker forces this re-architecture, which is in fact a strictly better design.</p>
+</div>
+<pre><code>struct Analysis&lt;&#39;a&gt; {
+    anchor:   Option&lt;&amp;&#39;a str&gt;,
+    tag:      Option&lt;&amp;&#39;a str&gt;,
+    value:    &amp;&#39;a str,
+    style:    ScalarStyle,
+    multiline: bool,
+    flow_plain_allowed: bool,
+    block_plain_allowed: bool,
+    single_quoted_allowed: bool,
+    block_allowed: bool,
+}
+
+impl Emitter {
+    fn analyze&lt;&#39;a&gt;(&amp;self, ev: &amp;&#39;a Event&lt;&#39;a&gt;) -&gt; Result&lt;Analysis&lt;&#39;a&gt;, Error&gt;;
+
+    fn emit_scalar&lt;&#39;a&gt;(
+        &amp;mut self,
+        ev: &amp;&#39;a Event&lt;&#39;a&gt;,
+        analysis: &amp;Analysis&lt;&#39;a&gt;,
+    ) -&gt; Result&lt;(), Error&gt;;
+}</code></pre>
+<p>The signature of <code>emit_scalar</code> now <em>documents</em> that <code>analysis</code> borrows from the same event <code>ev</code>; this is invisible in the C code and is a typical example of how the borrow checker promotes implicit aliasing to compile-time-checked structure.</p>
+<h1 data-number="5" id="sec:errors"><span class="header-section-number">5</span> Error Handling: thiserror vs. anyhow</h1>
+<h2 data-number="5.1" id="library-vs.-application-errors"><span class="header-section-number">5.1</span> Library vs. application errors</h2>
+<p>The Rust ecosystem has converged on a clean dichotomy:</p>
+<ul>
+<li><p><code>thiserror</code> for <em>library</em> crates that define their own <code>Error</code> type. Callers can pattern-match on variants. Errors are <em>enumerable, structured, semver-stable</em>.</p></li>
+<li><p><code>anyhow</code> for <em>application</em> code that just needs to propagate errors with context. Errors are <em>opaque, dynamic, ergonomic</em>.</p></li>
+</ul>
+<p><code>safe-libyaml</code> is a library and so must use <code>thiserror</code>. The error type is the public face of the crate; downstream users (<code>serde_yaml_ng</code> etc.) will pattern-match on its variants to distinguish reader errors from scanner errors from parser errors.</p>
+<pre><code>use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error(&quot;reader error at line {line}, column {column}: {problem}&quot;)]
+    Reader { problem: String, line: u64, column: u64 },
+
+    #[error(&quot;scanner error at line {line}, column {column}: {problem}&quot;)]
+    Scanner { problem: String, line: u64, column: u64,
+              context: Option&lt;String&gt;, context_mark: Option&lt;Mark&gt; },
+
+    #[error(&quot;parser error at line {line}, column {column}: {problem}&quot;)]
+    Parser  { problem: String, line: u64, column: u64,
+              context: Option&lt;String&gt;, context_mark: Option&lt;Mark&gt; },
+
+    #[error(&quot;composer error at line {line}, column {column}: {problem}&quot;)]
+    Composer { problem: String, line: u64, column: u64 },
+
+    #[error(&quot;emitter error: {problem}&quot;)]
+    Emitter { problem: String },
+
+    #[error(&quot;io error: {0}&quot;)]
+    Io(#[from] std::io::Error),
+
+    #[error(&quot;memory error: allocation of {0} bytes failed&quot;)]
+    Memory(usize),
+}</code></pre>
+<h2 data-number="5.2" id="why-we-do-not-chain-via-errorsource"><span class="header-section-number">5.2</span> Why we do <em>not</em> chain via <code>Error::source()</code></h2>
+<p>A common Rust style is to chain errors via the <code>std::error::Error::source()</code> method. For <code>safe-libyaml</code> we deliberately flatten the error structure: the C <code>yaml_parser_t</code> stores a single problem with an optional “context” problem alongside, and the variant fields above mirror that shape exactly. This (a) preserves byte-for-byte error semantics with libyaml, (b) avoids dynamic dispatch through <code>dyn Error</code>, and (c) makes <code>Error: Send + Sync + ’static</code> trivially.</p>
+<h2 data-number="5.3" id="the-resulteventa-error-shape"><span class="header-section-number">5.3</span> The <code>Result&lt;Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;, Error&gt;</code> shape</h2>
+<p>The natural signature for the parser entry point is:</p>
+<pre><code>impl&lt;&#39;a&gt; Parser&lt;&#39;a&gt; {
+    #[must_use = &quot;events that are not consumed are silently dropped&quot;]
+    pub fn parse(&amp;mut self) -&gt; Result&lt;Event&lt;&#39;a&gt;, Error&gt;;
+}</code></pre>
+<p>The <code>#[must_use]</code> attribute is essential: it converts the C-style “ignored return value” bug class into a compile-time warning. The lifetime <span class="math inline">\(\ensuremath{\,&#39;\!a}\)</span> on the returned event is inherited from the parser, which in turn was set at construction.</p>
+<div class="example">
+<p><em>Example 1</em> (Driving the parser).  A typical consumer loop:</p>
+<pre><code>let input = std::fs::read(&quot;config.yaml&quot;)?;
+let mut p = safe_libyaml::Parser::from_slice(&amp;input);
+loop {
+    match p.parse()? {
+        Event::StreamEnd =&gt; break,
+        Event::Scalar { value, .. } =&gt; println!(&quot;{value}&quot;),
+        _ =&gt; {}
+    }
+}</code></pre>
+<p>The <code>?</code> operator propagates I/O errors and parse errors uniformly.</p>
+</div>
+<h1 data-number="6" id="sec:memory"><span class="header-section-number">6</span> Memory Management: From C Macros to <code>std</code></h1>
+<h2 data-number="6.1" id="the-libyaml-macro-family"><span class="header-section-number">6.1</span> The <code>libyaml</code> macro family</h2>
+<p>The C source defines a family of capacity-doubling collection macros in <code>yaml_private.h</code>:</p>
+<ul>
+<li><p><code>STRING_INIT</code>, <code>STRING_EXTEND</code>, <code>STRING_DEL</code>, <code>STRING_JOIN</code>: byte buffers (start/end/pointer triples).</p></li>
+<li><p><code>STACK_INIT</code>, <code>STACK_PUSH</code>, <code>STACK_POP</code>, <code>STACK_DEL</code>: initial capacity <span class="math inline">\(16\)</span>.</p></li>
+<li><p><code>QUEUE_INIT</code>, <code>ENQUEUE</code>, <code>DEQUEUE</code>, <code>QUEUE_DEL</code>: initial capacity <span class="math inline">\(16\)</span>.</p></li>
+</ul>
+<p>Each macro hand-rolls a typed dynamic array with manual realloc. The naive <code>c2rust</code> translation preserves the raw pointer arithmetic verbatim; <code>unsafe-libyaml</code> contains hundreds of these expansions. The safe-Rust translation is mechanical:</p>
+<div class="center">
+<table>
+<thead>
+<tr>
+<th style="text-align: left;"><strong>C macro</strong></th>
+<th style="text-align: left;"><strong>Rust replacement</strong></th>
+<th style="text-align: left;"><strong>Safety property</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>yaml_string_t</code></td>
+<td style="text-align: left;"><code>Vec&lt;u8&gt;</code></td>
+<td style="text-align: left;">length-checked indexing</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STRING_INIT(s, n)</code></td>
+<td style="text-align: left;"><code>Vec::with_capacity(n)</code></td>
+<td style="text-align: left;">no UAF</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STRING_EXTEND(s)</code></td>
+<td style="text-align: left;"><code>s.reserve(1)</code></td>
+<td style="text-align: left;">no double-free</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STRING_DEL(s)</code></td>
+<td style="text-align: left;"><em>drop on scope exit</em></td>
+<td style="text-align: left;">no leak</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>yaml_stack_t</code></td>
+<td style="text-align: left;"><code>Vec&lt;T&gt;</code></td>
+<td style="text-align: left;">length-checked indexing</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STACK_INIT(s, T)</code></td>
+<td style="text-align: left;"><code>Vec::&lt;T&gt;::with_capacity(16)</code></td>
+<td style="text-align: left;">–</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STACK_PUSH(s, v)</code></td>
+<td style="text-align: left;"><code>s.push(v)</code></td>
+<td style="text-align: left;">–</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>STACK_POP(s)</code></td>
+<td style="text-align: left;"><code>s.pop().ok_or(Error::…)?</code></td>
+<td style="text-align: left;">no panic on empty</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>yaml_queue_t</code></td>
+<td style="text-align: left;"><code>VecDeque&lt;T&gt;</code></td>
+<td style="text-align: left;">length-checked indexing</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>QUEUE_INIT(q, T)</code></td>
+<td style="text-align: left;"><code>VecDeque::&lt;T&gt;::with_capacity(16)</code></td>
+<td style="text-align: left;">–</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>ENQUEUE(q, v)</code></td>
+<td style="text-align: left;"><code>q.push_back(v)</code></td>
+<td style="text-align: left;">–</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>DEQUEUE(q)</code></td>
+<td style="text-align: left;"><code>q.pop_front().ok_or(Error::…)?</code></td>
+<td style="text-align: left;">no panic on empty</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>We deliberately avoid <code>.unwrap()</code> as the canonical translation for <code>STACK_POP</code> and <code>DEQUEUE</code>. <code>Vec::pop</code> returns an <code>Option&lt;T&gt;</code>; the safe-Rust idiom uses <code>.ok_or(…)?</code> to convert “empty stack” (a parser-state-machine inconsistency) into a typed <code>Error</code> variant rather than a panic. Reserving <code>.unwrap()</code> for genuine “cannot happen” invariants is part of the project’s lint policy (see Appendix A’s <code>lints.toml</code>), and panics in a streaming parser would be a denial-of-service vector against any caller that feeds adversarial input.</p>
+<h2 data-number="6.2" id="capacity-doubling-proposition"><span class="header-section-number">6.2</span> Capacity-doubling proposition</h2>
+<div id="thm:amortised" class="proposition">
+<p><strong>Proposition 14</strong> (Amortised constant push).  <em>For <code>Vec::push</code> with the standard doubling growth policy, the amortised cost of <span class="math inline">\(n\)</span> consecutive pushes is <span class="math inline">\(O(n)\)</span> total, hence <span class="math inline">\(O(1)\)</span> per push. This matches the asymptotic behaviour of <code>libyaml</code>’s <code>STACK_PUSH</code> macro and is a textbook result; we restate it only to make explicit that the <code>Vec</code> substitution incurs no asymptotic performance cost.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Standard accounting argument: pre-charge each push with <span class="math inline">\(3\)</span> tokens; one pays for the push itself, two are saved. When the array doubles from capacity <span class="math inline">\(k\)</span> to <span class="math inline">\(2k\)</span>, we have <span class="math inline">\(2k\)</span> saved tokens (two per past push), exactly enough to copy <span class="math inline">\(k\)</span> elements. Hence total cost over <span class="math inline">\(n\)</span> pushes is at most <span class="math inline">\(3n\)</span>. ◻</p>
+</div>
+<h2 data-number="6.3" id="when-cow-earns-its-keep"><span class="header-section-number">6.3</span> When <code>Cow</code> earns its keep</h2>
+<p>We deploy <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> (rather than always-<code>String</code>) specifically in the public <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> fields where zero-copy is achievable for the common case (plain unquoted scalars are substrings of the input) and fallback-to-owned is required for the uncommon case (escape-processed scalars). Internally the parser uses raw <code>Vec&lt;u8&gt;</code>/<code>String</code> buffers; the <code>Cow</code> appears only at the public API boundary.</p>
+<h2 data-number="6.4" id="sec:utf8-default"><span class="header-section-number">6.4</span> The <code>BString</code> alternative and the UTF-8 default</h2>
+<p>For YAML, scalar <em>values</em> are not unconditionally guaranteed to be UTF-8: the YAML 1.1 spec admits the YAML stream encoded in UTF-8, UTF-16, or UTF-32, and within double-quoted scalars permits escape-encoded byte sequences whose decoded form is not necessarily a valid UTF-8 string. Two reasonable designs are possible:</p>
+<ol>
+<li><p><em>Strict UTF-8 default</em>: scalar values are <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code>; non-UTF-8 input is a parse error. This matches <code>libyaml-safer</code> and <code>serde_yaml</code>’s historical behaviour.</p></li>
+<li><p><em>Lenient bytes default</em>: scalar values are <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, [u8]&gt;</code> or the <code>bstr::BStr</code> type. Non-UTF-8 input is preserved verbatim.</p></li>
+</ol>
+<p><strong>The choice and its justification.</strong> <code>safe-libyaml</code> adopts (1) as the <em>default</em> type, and exposes a sibling <code>ByteEvent&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> type (with <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, [u8]&gt;</code> payloads) for the lenient case, with a <code>TryFrom&lt;ByteEvent&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;&gt;</code> impl that produces an <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> on UTF-8-validatable input. Three engineering reasons make (1) the right default:</p>
+<ol>
+<li><p><em>Drop-in compatibility with the consumer ecosystem and the <code>serde</code> data model</em>. The downstream forks (<code>serde_yaml_ng</code>, <code>serde_yaml_bw</code>, <code>serde_norway</code>) already produce <code>String</code>-typed outputs in their public APIs. More fundamentally, <code>serde</code>’s data model treats string-typed values as valid UTF-8 by construction (via <code>Visitor::visit_str(&amp;str)</code>); a bytes-first parser would force every consumer to insert UTF-8 validation at the boundary <em>anyway</em>, defeating the purpose of a drop-in replacement and adding the cost twice.</p></li>
+<li><p><em>Empirical input distribution</em>. The Kubernetes, Ansible, and CI/CD-pipeline use cases that generate the bulk of real YAML traffic emit UTF-8 by construction: they originate from JSON-like serialisers, from keyboard-typed configuration, or from build-system templates. Non-UTF-8 double-quoted scalars are exceedingly rare in practice; pessimising the common case to accommodate them inverts the cost ratio.</p></li>
+<li><p><em>Failure mode is recoverable, not silent</em>. If a consumer encounters non-UTF-8 input under the default API, they receive a typed <code>Error::Scanner</code> variant pointing to the exact offset, and may either reject the input (often the right answer) or re-parse with the <code>ByteEvent</code> API. The failure surface is observable and auditable, in contrast to the C library’s silent acceptance of invalid UTF-8 that may corrupt downstream consumers expecting valid strings.</p></li>
+</ol>
+<p><strong>Impact on legacy YAML.</strong> Files that intentionally embed non-UTF-8 byte sequences in scalars — a niche but real use case for binary blobs encoded in YAML for transport — must use the <code>ByteEvent</code> API explicitly, or use the standard YAML 1.2 <code>!!binary</code> tag with base64-encoded ASCII payload (which round-trips through the strict-UTF-8 API trivially). We document this trade-off prominently in the crate’s README.</p>
+<p><strong>Why not lenient by default with strict opt-in?</strong> A lenient default produces ergonomic friction at the consumer side: every downstream function that expects <code>&amp;str</code> would need a <code>from_utf8</code> call. Inverting the default trades a small loss in spec coverage for a large gain in caller ergonomics; for a library whose 90M-download ecosystem is built around <code>serde</code>-style <code>String</code> fields, this is the correct trade.</p>
+<h1 data-number="7" id="sec:nostd"><span class="header-section-number">7</span> no_std + alloc</h1>
+<h2 data-number="7.1" id="what-changes-when-shipping-for-embedded"><span class="header-section-number">7.1</span> What changes when shipping for embedded</h2>
+<p>Many YAML use cases are embedded: configuration on small Linux SBCs, robot control fleets, IoT firmware. We make <code>safe-libyaml</code> compatible with <code>#![no_std]</code> provided the target supports an allocator (<code>alloc</code> crate). Pure no-allocation YAML parsing is a separate research problem; we do not attempt it here.</p>
+<pre><code>#![cfg_attr(not(feature = &quot;std&quot;), no_std)]
+extern crate alloc;
+use alloc::{vec::Vec, collections::VecDeque, string::String, borrow::Cow};
+use core::fmt;</code></pre>
+<h2 data-number="7.2" id="the-coreffi-story"><span class="header-section-number">7.2</span> The <code>core::ffi</code> story</h2>
+<p>The <code>core::ffi</code> module (stabilised in Rust 1.64) provides <code>c_char</code>, <code>c_int</code>, <code>c_void</code>, etc. without requiring <code>std</code>. This means the FFI shim crate <code>safe-libyaml-sys</code> can also be <code>no_std</code>-compatible, important for embedded users who want a drop-in C ABI.</p>
+<h2 data-number="7.3" id="feature-flags"><span class="header-section-number">7.3</span> Feature flags</h2>
+<p>The <code>Cargo.toml</code> declares a clean feature matrix:</p>
+<pre><code>[features]
+default = [&quot;std&quot;]
+std     = []                 # opt out for no_std targets
+serde   = [&quot;dep:serde&quot;]      # serde::Serialize/Deserialize for Event
+ffi     = []                 # build the C ABI exports
+fuzzing = []                 # extra invariant checks for fuzz harness</code></pre>
+<div class="remark">
+<p><em>Remark 15</em> (Avoid the trait-object <code>Box&lt;dyn Read&gt;</code> trap).  The natural Rust signature for “parse from any reader” is <code>Box&lt;dyn Read + </code><span class="math inline">\(\,&#39;\!static\)</span><code>&gt;</code>, which requires heap allocation and dynamic dispatch. This is fine for std targets but nontrivial in <code>no_std + alloc</code>. We provide <code>Parser::from_reader&lt;R: Read&gt;</code> generic over <code>R</code> (monomorphised) as the no_std-friendly alternative.</p>
+</div>
+<h1 data-number="8" id="sec:tagged-enums"><span class="header-section-number">8</span> Tagged Enums vs. C Unions</h1>
+<h2 data-number="8.1" id="the-discriminant"><span class="header-section-number">8.1</span> The discriminant</h2>
+<p>A C tagged union is two related declarations:</p>
+<pre data-language=""><code>typedef struct {
+    yaml_event_type_t type;
+    union {
+        struct { /* stream_start data */ } stream_start;
+        struct { /* document_start data */ } document_start;
+        ...
+        struct { /* scalar data */ } scalar;
+    } data;
+    yaml_mark_t start_mark, end_mark;
+} yaml_event_t;</code></pre>
+<p>The <code>type</code> field is the discriminant, but the C compiler does not enforce that callers read only the union variant matching the discriminant. Reading the wrong variant is undefined behaviour. The Rust translation <em>fuses</em> the discriminant and the data:</p>
+<pre><code>pub enum Event&lt;&#39;a&gt; {
+    StreamStart   { encoding: Encoding },
+    StreamEnd,
+    DocumentStart { /* ... */ },
+    DocumentEnd   { implicit: bool },
+    Alias         { anchor: Cow&lt;&#39;a, str&gt; },
+    Scalar        { /* ... */ },
+    SequenceStart { /* ... */ },
+    SequenceEnd,
+    MappingStart  { /* ... */ },
+    MappingEnd,
+}</code></pre>
+<div id="thm:exhaustiveness" class="proposition">
+<p><strong>Proposition 16</strong> (Match exhaustiveness as a safety multiplier).  <em>Suppose <span class="math inline">\(E\)</span> is a Rust enum with <span class="math inline">\(n\)</span> variants and a <code>match</code> expression <code>m</code> on a value of type <span class="math inline">\(E\)</span>. The Rust compiler statically rejects <code>m</code> unless every variant is reachable from at least one arm (potentially via wildcard <code>_</code>). Adding a new variant to <span class="math inline">\(E\)</span> in a non-breaking-major version requires the <code>#[non_exhaustive]</code> attribute; otherwise downstream <code>match</code> expressions break and the compiler points to every site requiring an update. This is a standard property of Rust’s pattern-matching design <span class="citation" data-cites="rustbelt"></span>; we restate it because it is the reason a tagged-union <span class="math inline">\(\to\)</span> enum translation upgrades silent C bugs into compile-time errors.</em></p>
+</div>
+<p>This is the key safety multiplier: when libyaml adds a hypothetical new event (say, <code>YAML_PARSE_DIRECTIVE_EVENT</code>), every C consumer silently breaks; the Rust crate’s downstream consumers instead get a compile error pointing to the exact site needing a new arm. The cost of API evolution is paid once at compile time, not many times at runtime.</p>
+<h2 data-number="8.2" id="the-non_exhaustive-discipline"><span class="header-section-number">8.2</span> The <code>#[non_exhaustive]</code> discipline</h2>
+<p>For the public <code>Event</code> enum we recommend <code>#[non_exhaustive]</code> to permit non-breaking variant addition; for the internal <code>Token</code> enum (not part of the public API) we omit the attribute so the compiler can exhaustively verify scanner <span class="math inline">\(\to\)</span> parser dataflow.</p>
+<pre><code>#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event&lt;&#39;a&gt; { /* variants as above */ }
+
+// Internal -- exhaustiveness checked by compiler:
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Token&lt;&#39;a&gt; { /* 22 token kinds */ }</code></pre>
+<h1 data-number="9" id="sec:unsafe"><span class="header-section-number">9</span> Unsafe Boundaries</h1>
+<h2 data-number="9.1" id="discipline"><span class="header-section-number">9.1</span> Discipline</h2>
+<p>The crate adopts the following lint configuration in the root module:</p>
+<pre><code>#![deny(unsafe_code)]                  // no unsafe in the safe crate
+#![deny(missing_docs)]
+#![deny(rust_2018_idioms)]
+#![warn(clippy::pedantic, clippy::nursery)]</code></pre>
+<p>The single <code>#![deny(unsafe_code)]</code> line is the most consequential: it instructs the compiler to reject every <code>unsafe</code> block in the crate, full stop. Any time the implementation needs unsafe, the developer must justify lifting the deny — a workflow that surfaces every unsafe introduction to code review.</p>
+<h2 data-number="9.2" id="the-safe-libyaml-sys-split"><span class="header-section-number">9.2</span> The <code>safe-libyaml-sys</code> split</h2>
+<p>The C ABI exports must be <code>unsafe</code> (the safety contract is on the caller, who must maintain raw-pointer validity). We therefore split the workspace:</p>
+<ul>
+<li><p><code>safe-libyaml</code> — the safe Rust crate; <code>#![deny(unsafe_code)]</code>. Internal use only of safe <code>std</code> types.</p></li>
+<li><p><code>safe-libyaml-sys</code> — the FFI shim; <code>#![deny(unsafe_op_in_unsafe_fn)]</code> forces every dereference inside an <code>extern "C"</code> function to live inside an explicit <code>unsafe { ... }</code> block with a <code>// SAFETY:</code> comment explaining the invariant. Re-exports nothing of substance; merely wraps <code>safe-libyaml</code>’s safe API in C symbols.</p></li>
+</ul>
+<div id="prop:compositional-safety" class="proposition">
+<p><strong>Proposition 17</strong> (Compositional safety).  <em>Suppose every <code>unsafe</code> block in <code>safe-libyaml-sys</code> satisfies its documented <code>// SAFETY:</code> invariants, and <code>safe-libyaml</code> contains no <code>unsafe</code> blocks. Then any data race, use-after-free, or out-of-bounds access in a Rust caller of <code>safe-libyaml</code> is impossible unless caused by a <em>C</em> caller violating the FFI contract. In particular, pure-Rust callers cannot trigger any UB inherited from <code>libyaml</code>’s C behaviour.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof sketch.</em> Rust’s type soundness theorem <span class="citation" data-cites="rustbelt"></span> states that well-typed safe code cannot exhibit UB. <code>safe-libyaml</code> is well-typed safe code by construction (<code>#![deny(unsafe_code)]</code>). The composition of safe Rust and safe Rust is safe Rust. The only entry points for UB are the <code>unsafe extern "C"</code> functions in the sys crate, whose preconditions are enforced on the caller. ◻</p>
+</div>
+<h2 data-number="9.3" id="interior-unsafety-as-an-anti-pattern"><span class="header-section-number">9.3</span> Interior unsafety as an anti-pattern</h2>
+<p>A common <code>c2rust</code> output uses <code>unsafe { }</code> blocks deep inside the parser to wrap raw pointer arithmetic. This is the <em>wrong</em> boundary: a panic or misuse propagates back through allegedly safe wrappers. The <code>safe-libyaml</code> discipline is to prohibit this entirely. If ergonomic considerations seem to demand interior unsafety, the right response is to refactor the data structure (e.g. replace a self-referential struct with a parameter-passed <code>Analysis&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> per Remark <a href="#rem:libyaml-safer" data-reference-type="ref" data-reference="rem:libyaml-safer">13</a>).</p>
+<h1 data-number="10" id="sec:ffi"><span class="header-section-number">10</span> ABI-Compatible C Export</h1>
+<h2 data-number="10.1" id="the-drop-in-replacement-principle"><span class="header-section-number">10.1</span> The drop-in replacement principle</h2>
+<p><code>libyaml</code>’s public header <code>yaml.h</code> defines roughly 80 <code>extern</code> symbols: parser/emitter constructors and destructors, event constructors, document tree manipulators, and version-info accessors. A <em>drop-in</em> Rust replacement is a crate that, when compiled with the <code>ffi</code> feature, produces a <code>libsafe_yaml.so</code> (or <code>.dylib</code> or <code>.dll</code>) with byte-identical exported symbols. C callers and existing Rust crates such as <code>serde_yaml_ng</code> (which links against <code>unsafe-libyaml</code>) can be relinked against <code>safe-libyaml-sys</code> without modification.</p>
+<h2 data-number="10.2" id="reprc-layout"><span class="header-section-number">10.2</span> <code>#[repr(C)]</code> layout</h2>
+<pre><code>#[repr(C)]
+pub struct yaml_parser_t {
+    inner: *mut crate::Parser&lt;&#39;static&gt;,  // opaque to C
+    error: yaml_error_type_t,
+    problem: *const c_char,
+    problem_offset: size_t,
+    problem_value: c_int,
+    problem_mark: yaml_mark_t,
+    context: *const c_char,
+    context_mark: yaml_mark_t,
+    /* padding to match libyaml struct size */
+    _padding: [u8; PARSER_PADDING],
+}
+
+#[repr(C)]
+pub struct yaml_mark_t {
+    pub index:  size_t,
+    pub line:   size_t,
+    pub column: size_t,
+}
+
+#[repr(C, u32)]
+pub enum yaml_event_type_t {
+    YAML_NO_EVENT = 0,
+    YAML_STREAM_START_EVENT,
+    YAML_STREAM_END_EVENT,
+    YAML_DOCUMENT_START_EVENT,
+    YAML_DOCUMENT_END_EVENT,
+    YAML_ALIAS_EVENT,
+    YAML_SCALAR_EVENT,
+    YAML_SEQUENCE_START_EVENT,
+    YAML_SEQUENCE_END_EVENT,
+    YAML_MAPPING_START_EVENT,
+    YAML_MAPPING_END_EVENT,
+}</code></pre>
+<h2 data-number="10.3" id="the-cbindgen-contract"><span class="header-section-number">10.3</span> The <code>cbindgen</code> contract</h2>
+<p>We commit a <code>cbindgen.toml</code> to the sys crate:</p>
+<pre data-language=""><code>language = &quot;C&quot;
+header = &quot;/* SPDX-License-Identifier: MIT -- safe-libyaml */&quot;
+include_guard = &quot;SAFE_YAML_H_INCLUDED&quot;
+pragma_once = true
+cpp_compat = true
+style = &quot;tag&quot;
+
+[export]
+prefix = &quot;yaml_&quot;           # match libyaml&#39;s symbol prefix
+include = [&quot;yaml_parser_t&quot;, &quot;yaml_emitter_t&quot;, &quot;yaml_event_t&quot;,
+           &quot;yaml_document_t&quot;, &quot;yaml_node_t&quot;, &quot;yaml_mark_t&quot;,
+           &quot;yaml_error_type_t&quot;, &quot;yaml_event_type_t&quot;,
+           &quot;yaml_scalar_style_t&quot;, &quot;yaml_sequence_style_t&quot;,
+           &quot;yaml_mapping_style_t&quot;, &quot;yaml_encoding_t&quot;]
+
+[parse]
+parse_deps = false</code></pre>
+<p>A CI job runs:</p>
+<pre data-language=""><code>cbindgen --config cbindgen.toml --crate safe-libyaml-sys \
+         --output target/yaml.h
+diff -u reference/libyaml/include/yaml.h target/yaml.h \
+        &gt; target/yaml-h-diff.txt</code></pre>
+<p>and fails the build if the diff exceeds an allow-list of cosmetic differences (whitespace, comments, ordering). This is the formal <em>ABI parity gate</em>.</p>
+<h2 data-number="10.4" id="symbol-level-enumeration"><span class="header-section-number">10.4</span> Symbol-level enumeration</h2>
+<pre data-language=""><code>nm -D libsafe_yaml.so | awk &#39;$2==&quot;T&quot;{print $3}&#39; | sort &gt; target/syms.rust
+nm -D libyaml.so.0    | awk &#39;$2==&quot;T&quot;{print $3}&#39; | sort &gt; target/syms.c
+diff -u target/syms.c target/syms.rust</code></pre>
+<p>must produce empty output for a true drop-in. The CI gate is identical to the cbindgen check.</p>
+<h2 data-number="10.5" id="sec:ffi-file"><span class="header-section-number">10.5</span> Bridging C <code>FILE*</code> to Rust <code>Read</code></h2>
+<p><code>libyaml</code>’s public API includes <code>yaml_parser_set_input_file(parser, FILE *file)</code>, and any ABI-faithful drop-in must export the same signature. The challenge is that <code>FILE*</code> is an opaque C-stdlib handle whose internals are not specified; we cannot read it from safe Rust directly. The <code>-sys</code> crate solves this by wrapping the <code>FILE*</code> in a thin <code>std::io::Read</code> adapter:</p>
+<pre><code>struct CFileReader { file: *mut libc::FILE }
+
+impl std::io::Read for CFileReader {
+    fn read(&amp;mut self, buf: &amp;mut [u8]) -&gt; std::io::Result&lt;usize&gt; {
+        // SAFETY: `self.file` is a non-null FILE* whose validity is
+        //   the responsibility of the C caller (precondition of
+        //   yaml_parser_set_input_file). `fread` is bounded by buf.len().
+        let n = unsafe {
+            libc::fread(buf.as_mut_ptr().cast(), 1, buf.len(), self.file)
+        };
+        // SAFETY: `ferror` only inspects the FILE* and returns int.
+        if n == 0 &amp;&amp; unsafe { libc::ferror(self.file) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n)
+    }
+}
+
+#[no_mangle]
+pub unsafe extern &quot;C&quot; fn yaml_parser_set_input_file(
+    parser: *mut yaml_parser_t,
+    file:   *mut libc::FILE,
+) {
+    // SAFETY: `parser` is a valid initialised yaml_parser_t (caller
+    //   precondition); `file` is a non-null FILE* opened for reading.
+    let parser = unsafe { &amp;mut *parser };
+    parser.set_reader(Box::new(CFileReader { file }));
+}</code></pre>
+<p>The safety invariants the <code>unsafe</code> block must uphold are: (i) <code>file</code> is a non-null <code>FILE*</code> that remains open and valid for the lifetime of the parser (caller’s responsibility, exactly as in the C original); (ii) <code>buf.as_mut_ptr()</code> is valid for writes of <code>buf.len()</code> bytes (Rust’s slice invariants guarantee this); (iii) the <code>FILE*</code> is not concurrently accessed from another thread (matching C’s stdio thread-safety expectations and libyaml’s existing single-threaded contract).</p>
+<p>This adapter pattern keeps the unsafe code-surface tiny — two <code>libc::fread</code>/<code>ferror</code> calls — while letting the entire parser body remain in safe Rust. The same pattern in reverse provides <code>yaml_emitter_set_output_file</code> via a <code>CFileWriter: std::io::Write</code>.</p>
+<h2 data-number="10.6" id="why-serde_yaml_ng-matters"><span class="header-section-number">10.6</span> Why <code>serde_yaml_ng</code> matters</h2>
+<p>The two main forks (<code>serde_yaml_ng</code> and <code>serde_yaml_bw</code>) together account for roughly 90M downloads of YAML parsing in the Rust ecosystem; both currently depend on <code>unsafe-libyaml</code>. If <code>safe-libyaml-sys</code> is a perfect drop-in, the change for these crates is a single line in their <code>Cargo.toml</code>:</p>
+<pre data-language=""><code>- unsafe-libyaml = &quot;0.2&quot;
++ safe-libyaml-sys = &quot;0.1&quot;</code></pre>
+<p>This is the engineering target that justifies the effort: a single PR upgrades the security posture of every Rust crate using YAML.</p>
+<h1 data-number="11" id="sec:tooling"><span class="header-section-number">11</span> Tooling: clippy, rustfmt, cargo-deny, cargo-audit, cargo-semver-checks</h1>
+<div class="description">
+<p>enforces formatting parity. CI gate.</p>
+<p>surfaces idiom violations. Project allow-list is documented in <code>lints.toml</code>.</p>
+<p>verifies no banned licenses, no advisories on dependencies, no duplicate dependency versions.</p>
+<p>checks the RustSec advisory database. Targets zero vulnerabilities.</p>
+<p>verifies that minor releases do not break the public API. Run pre-release.</p>
+<p>runs the test suite under Miri’s Stacked Borrows checker. Required to pass with zero UB.</p>
+<p>CI job runs differential fuzzing against C <code>libyaml</code> for an hour.</p>
+<p>criterion benchmarks gate performance regression at <span class="math inline">\(\pm\)</span>5% relative to baseline.</p>
+</div>
+<p>A reference <code>lints.toml</code> is provided in Appendix A.</p>
+<h1 data-number="12" id="sec:related"><span class="header-section-number">12</span> Related Work</h1>
+<p><strong>Parser combinators.</strong> <code>nom</code> <span class="citation" data-cites="nom"></span> and its successor <code>winnow</code> <span class="citation" data-cites="winnow"></span> are the dominant parser-combinator libraries. They popularised the <code>&amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> [u8]</code> input pattern that we adopt; they are not directly applicable to YAML because of the latter’s indentation-sensitive grammar but they prove the lifetime-parameterised idiom scales.</p>
+<p><strong><code>serde</code> and friends.</strong> <code>serde_json</code> <span class="citation" data-cites="serde-json"></span> demonstrates that a streaming parser with both borrowed and owned modes (<code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code>) is feasible and ergonomic. The three maintained forks of the deprecated <code>serde_yaml</code> —  <code>serde_yaml_ng</code>, <code>serde_yaml_bw</code>, and <code>serde_norway</code> — all target <code>unsafe-libyaml</code> as their parser backend, and any of them is a candidate for the first PR.</p>
+<p><strong>Pure-Rust YAML parsers.</strong> <code>saphyr-parser</code> and the higher-level <code>serde-saphyr</code> provide a fully-Rust alternative; they do not target ABI compatibility with <code>libyaml</code>. Our crate is complementary: it gives the existing C and <code>serde_yaml_*</code> ecosystems a zero-friction migration path, where <code>saphyr</code> requires API rewrites.</p>
+<p><strong>Memory-safety initiatives.</strong> The Prossimo / ISRG portfolio (<code>rustls</code>, <code>sudo-rs</code>, <code>ntpd-rs</code>, <code>hickory-dns</code>, <code>rav1d</code>, <code>zlib-rs</code>, <code>libbzip2-rs</code>, <code>libzstd-rs</code>) is the relevant prior art for production-grade C-to-Rust replacements. <code>rav1d</code> in particular is a 50K-LOC AV1 decoder whose performance matches the C reference <code>dav1d</code>; its lifetime discipline informs ours.</p>
+<p><strong>Static analysis for ownership inference.</strong> Crown <span class="citation" data-cites="crown"></span> (CAV 2023), Laertes <span class="citation" data-cites="laertes"></span> (OOPSLA 2023), and the academic line through SACTOR (March 2025), Rustine (2025), EvoC2Rust (2025), and ORBIT (April 2026) inform the upstream analysis that produces our scaffold.</p>
+<p><strong>Verified Rust formalisation.</strong> RustBelt <span class="citation" data-cites="rustbelt"></span> (POPL 2018) gives the soundness theorem we cite in Proposition <a href="#prop:compositional-safety" data-reference-type="ref" data-reference="prop:compositional-safety">17</a>; Miri <span class="citation" data-cites="miri-popl2026"></span> (POPL 2026) provides the dynamic UB checker; Kani <span class="citation" data-cites="kani"></span> provides bounded model checking for high-assurance predicates.</p>
+<h1 data-number="13" id="sec:results"><span class="header-section-number">13</span> Results</h1>
+<p>We summarise the design contributions.</p>
+<div id="thm:safe-libyaml-api" class="proposition">
+<p><strong>Proposition 18</strong> (Design summary: properties of the proposed API).  <em>The public API of <code>safe-libyaml</code> as specified in Sections <a href="#sec:ownership-streaming" data-reference-type="ref" data-reference="sec:ownership-streaming">3</a>–<a href="#sec:ffi" data-reference-type="ref" data-reference="sec:ffi">10</a> is <em>designed</em> to satisfy the following properties; the propositions and definitions cited inside the list are the design’s structural justifications, not empirical verifications of the in-progress build:</em></p>
+<ol>
+<li><p><em><em>Memory safety</em>: every operation is statically verified by the Rust borrow checker; no <code>unsafe</code> block is required in the safe crate (Proposition <a href="#prop:compositional-safety" data-reference-type="ref" data-reference="prop:compositional-safety">17</a>).</em></p></li>
+<li><p><em><em>Zero-copy in the common case</em>: plain scalars borrow directly from the input buffer (Proposition <a href="#prop:cow-events" data-reference-type="ref" data-reference="prop:cow-events">12</a>).</em></p></li>
+<li><p><em><em>Exhaustive event handling</em>: the <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> enum forces every match site to handle every variant (Proposition <a href="#thm:exhaustiveness" data-reference-type="ref" data-reference="thm:exhaustiveness">16</a>).</em></p></li>
+<li><p><em><em>Composable errors</em>: <code>Result&lt;Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;, Error&gt;</code> allows uniform <code>?</code>-propagation (Proposition <a href="#thm:errors-compose" data-reference-type="ref" data-reference="thm:errors-compose">10</a>).</em></p></li>
+<li><p><em><em>ABI parity</em>: <code>safe-libyaml-sys</code> exports the same C symbols as <code>libyaml.so</code> as verified by <code>cbindgen</code> diff and <code>nm</code> enumeration.</em></p></li>
+<li><p><em><em>Amortised performance</em>: collection operations have the same asymptotic complexity as the C macros (Proposition <a href="#thm:amortised" data-reference-type="ref" data-reference="thm:amortised">14</a>).</em></p></li>
+</ol>
+</div>
+<div class="corollary">
+<p><strong>Corollary 19</strong> (Drop-in replacement, conditional).  <em><em>Provided</em> the implementation realised by Appendix A’s plan satisfies the <em>ABI parity</em> clause of Proposition <a href="#thm:safe-libyaml-api" data-reference-type="ref" data-reference="thm:safe-libyaml-api">18</a> (verified by <code>cbindgen</code> diff and <code>nm</code> enumeration in CI), the crates <code>serde_yaml_ng</code> and <code>serde_yaml_bw</code> can replace their dependency <code>unsafe-libyaml = "0.2"</code> with <code>safe-libyaml-sys = "0.1"</code> via a single-line patch with no semantic behaviour change observable to their downstream consumers.</em></p>
+</div>
+<h1 data-number="14" id="sec:disc"><span class="header-section-number">14</span> Discussion</h1>
+<h2 data-number="14.1" id="performance-targets-not-measurements"><span class="header-section-number">14.1</span> Performance: targets, not measurements</h2>
+<p>We make no measurement claim in this paper. The closest established data point is S. Ask’s manual port <code>libyaml-safer</code>, which has been informally reported as “largely on par” with <code>unsafe-libyaml</code> <span class="citation" data-cites="libyaml-safer-blog"></span>; this is an external result about a different (manually-written) crate and we cite it only as plausible evidence that the API shape we propose is not inherently slower than the C original. For the in-progress <code>safe-libyaml</code> itself, we set explicit <em>engineering targets</em> that the verification agents are responsible for measuring once the build exists: within <span class="math inline">\(2\times\)</span> of the C reference is PASS; within <span class="math inline">\(1.5\times\)</span> is GOOD; matching or exceeding C is EXCELLENT (plausible via LLVM’s better inlining of monomorphised generics, but not promised). Whether these targets are actually met is an empirical question outside the scope of this design paper; the benchmarker described in Appendix A’s Phase C must report the numbers before any performance claim about <code>safe-libyaml</code> is warranted.</p>
+<h2 data-number="14.2" id="limitations"><span class="header-section-number">14.2</span> Limitations</h2>
+<p>Several design choices are tensioned:</p>
+<ul>
+<li><p>The <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> shape requires UTF-8; YAML 1.1 permits non-UTF-8 in double-quoted scalars. The <code>ByteEvent</code> sibling is a pragmatic workaround but doubles the API surface.</p></li>
+<li><p>The lifetime parameter on <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> is viral: any struct holding events must also be parameterised. The <code>OwnedEvent</code> escape hatch addresses this at the cost of allocation.</p></li>
+<li><p>The <code>#[non_exhaustive]</code> attribute on <code>Event</code> prevents downstream exhaustive matching; this is the explicit price of API evolution.</p></li>
+<li><p><code>no_std</code> support requires <code>alloc</code>; we do not target truly heap-free YAML parsing (which would need a static-bounded buffer variant of the parser).</p></li>
+</ul>
+<h2 data-number="14.3" id="place-in-the-broader-project-optional-reading"><span class="header-section-number">14.3</span> Place in the broader project (optional reading)</h2>
+<p>This paper is self-contained and stands as a design specification on its own. For readers interested in the broader <em>Ferrous Bridge</em> context: a companion paper <span class="citation" data-cites="long-c"></span> treats the source side (which C idioms must be recovered), another <span class="citation" data-cites="long-transpile"></span> treats the translation process itself, and a strategic overview <span class="citation" data-cites="long-c2rust-strategy"></span> positions the work commercially. None of those are prerequisites for the design statements made here; the present paper is intentionally legible to a Rust engineer with no familiarity with the larger pipeline.</p>
+<h1 data-number="15" id="sec:concl"><span class="header-section-number">15</span> Conclusion</h1>
+<p>We have specified the API surface of <code>safe-libyaml</code>, a planned automated safe-Rust replacement for <code>unsafe-libyaml</code>, in enough detail that the prototype agents listed in Appendix A can begin implementation immediately. The central design moves are:</p>
+<ol>
+<li><p>A lifetime-parameterised <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> with <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> payloads for zero-copy scalars.</p></li>
+<li><p>A <code>thiserror</code>-derived <code>Error</code> enum mirroring <code>libyaml</code>’s problem categories.</p></li>
+<li><p>A <code>Vec</code>/<code>VecDeque</code> mapping for the C <code>STACK_*</code>/<code>QUEUE_*</code> macros.</p></li>
+<li><p>A two-crate workspace splitting the safe API (<code>safe-libyaml</code>, gated by a crate-level deny of <code>unsafe_code</code>) from the FFI shim (<code>safe-libyaml-sys</code>) that preserves <code>libyaml</code>’s exact C ABI.</p></li>
+<li><p>A CI gate of <code>rustc</code> + Miri + clippy + cargo-deny + <code>cbindgen</code> diff + a one-hour <code>cargo-fuzz</code> run, enforcing every property automatically.</p></li>
+</ol>
+<p>The work composes naturally with related designs that the reader may choose to consult: the source-side companion <span class="citation" data-cites="long-c"></span> supplies the ownership classification that the Appendix A OSG-to-Rust emitter consumes; the process-side companion <span class="citation" data-cites="long-transpile"></span> drives a per-function TRANSLATE-TEST-FIX loop against the API surface specified here. Neither is required to read or apply the present paper.</p>
+<div class="thebibliography">
+<p><span>99</span></p>
+<p>R. Jung, J.-H. Jourdan, R. Krebbers, D. Dreyer. <em>RustBelt: Securing the Foundations of the Rust Programming Language.</em> POPL 2018.</p>
+<p>R. Jung, H. H. Dang, et al. <em>Miri: Practical Undefined Behavior Detection for Rust.</em> POPL 2026.</p>
+<p>M. Tofte, J.-P. Talpin. <em>Region-based Memory Management.</em> Information and Computation 132(2), 1997.</p>
+<p>G. Couprie. <em>nom: A Byte-Oriented, Streaming, Zero-Copy Parser Combinator Library in Rust.</em> 2014–2026. <a href="https://github.com/rust-bakery/nom" class="uri">https://github.com/rust-bakery/nom</a></p>
+<p><em>winnow: A parser-combinator framework forked from nom.</em> <a href="https://github.com/winnow-rs/winnow" class="uri">https://github.com/winnow-rs/winnow</a></p>
+<p>D. Tolnay. <em>serde_json: A JSON serialization file format.</em> <a href="https://github.com/serde-rs/json" class="uri">https://github.com/serde-rs/json</a></p>
+<p>S. Ask. <em>Notes on porting libyaml to safe Rust.</em> <a href="https://simonask.github.io/libyaml-safer/" class="uri">https://simonask.github.io/libyaml-safer/</a>, February 2024.</p>
+<p>H. Zhang, K. Chen, et al. <em>Ownership Guided C to Rust Translation.</em> CAV 2023.</p>
+<p>M. Emre, R. Schroeder, K. Dewey, B. Hardekopf. <em>Translating C to Safer Rust.</em> OOPSLA 2023.</p>
+<p>A. Pochhammer, et al. <em>The Kani Rust Verifier.</em> Amazon AWS, 2022–2026. <a href="https://github.com/model-checking/kani" class="uri">https://github.com/model-checking/kani</a></p>
+<p>Immunant, Galois. <em>c2rust: a C to Rust transpiler.</em> <a href="https://github.com/immunant/c2rust" class="uri">https://github.com/immunant/c2rust</a></p>
+<p>M. Long. <em>C Language Semantics for Safe-Rust Translation.</em> GrokRxiv:2026.04.c [cs.PL], April 2026.</p>
+<p>M. Long. <em>Automated C-to-Rust Transpiling: Pipeline, Patterns, and Verification.</em> GrokRxiv:2026.04.c-rust-transpiling [cs.PL], April 2026.</p>
+<p>M. Long. <em>Compile-Time Supremacy: A Strategic Architecture for AI-Assisted C<span class="math inline">\(\to\)</span>Rust Migration at Scale.</em> GrokRxiv:2026.04.c2rust-compile-time-supremacy [cs.SE], April 2026.</p>
+</div>
+<h1 data-number="16" id="app:dev-plan"><span class="header-section-number">16</span> Development Plan for Prototype Agents (Scaffold and Idiom Phase)</h1>
+<h4 data-number="16.0.0.1" id="status-of-this-appendix."><span class="header-section-number">16.0.0.1</span> Status of this appendix.</h4>
+<p>This appendix is <em>supplementary material</em>, not a research result. Its purpose is to provide concrete evidence that the design specified in the body of the paper is <em>implementable</em> by the kind of agent pipeline we propose: by listing the actual tasks an A2 (Scaffold Builder) agent, an OSG-to-Rust emitter agent, and a C4 (Idiom Polisher) agent would execute, in the format mandated by the project’s knowledge-base addendum, we make the design falsifiable in the engineering sense (a reader could fork ferrous-bridge today and check whether the listed tasks compose into the specified API surface). The appendix does not replace experimental validation; it documents the bridge from specification to build.</p>
+<h2 data-number="16.1" id="the-exact-public-api-the-agents-must-target"><span class="header-section-number">16.1</span> The exact public API the agents must target</h2>
+<p>The agents output a workspace with two crates. We restate the exact public signatures so the agents have an unambiguous target.</p>
+<h3 data-number="16.1.1" id="safe-libyamlparser"><span class="header-section-number">16.1.1</span> <code>safe-libyaml::Parser</code></h3>
+<pre><code>pub struct Parser&lt;&#39;a&gt; {
+    /* private fields */
+    _marker: core::marker::PhantomData&lt;&amp;&#39;a [u8]&gt;,
+}
+
+impl&lt;&#39;a&gt; Parser&lt;&#39;a&gt; {
+    pub fn from_slice(input: &amp;&#39;a [u8]) -&gt; Parser&lt;&#39;a&gt;;
+    pub fn from_vec(input: Vec&lt;u8&gt;) -&gt; Parser&lt;&#39;static&gt;;
+    pub fn from_reader&lt;R: std::io::Read + &#39;static&gt;(r: R) -&gt; Parser&lt;&#39;static&gt;;
+
+    pub fn set_encoding(&amp;mut self, encoding: Encoding);
+    pub fn encoding(&amp;self) -&gt; Encoding;
+
+    #[must_use]
+    pub fn parse(&amp;mut self) -&gt; Result&lt;Event&lt;&#39;a&gt;, Error&gt;;
+
+    pub fn mark(&amp;self) -&gt; Mark;
+}</code></pre>
+<h3 data-number="16.1.2" id="safe-libyamlevent"><span class="header-section-number">16.1.2</span> <code>safe-libyaml::Event</code></h3>
+<pre><code>#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event&lt;&#39;a&gt; {
+    StreamStart   { encoding: Encoding },
+    StreamEnd,
+    DocumentStart { version: Option&lt;VersionDirective&gt;,
+                    tags: Vec&lt;TagDirective&lt;&#39;a&gt;&gt;,
+                    implicit: bool },
+    DocumentEnd   { implicit: bool },
+    Alias         { anchor: Cow&lt;&#39;a, str&gt; },
+    Scalar        { anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    value:  Cow&lt;&#39;a, str&gt;,
+                    plain_implicit: bool,
+                    quoted_implicit: bool,
+                    style:  ScalarStyle },
+    SequenceStart { anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    implicit: bool, style: SequenceStyle },
+    SequenceEnd,
+    MappingStart  { anchor: Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    tag:    Option&lt;Cow&lt;&#39;a, str&gt;&gt;,
+                    implicit: bool, style: MappingStyle },
+    MappingEnd,
+}
+
+impl&lt;&#39;a&gt; Event&lt;&#39;a&gt; {
+    pub fn into_owned(self) -&gt; OwnedEvent;
+    pub fn start_mark(&amp;self) -&gt; Mark;
+    pub fn end_mark(&amp;self)   -&gt; Mark;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEvent { /* Event&lt;&#39;static&gt; with all Cow::Owned */ }</code></pre>
+<h3 data-number="16.1.3" id="safe-libyamlemitter"><span class="header-section-number">16.1.3</span> <code>safe-libyaml::Emitter</code></h3>
+<pre><code>pub struct Emitter&lt;W: std::io::Write&gt; { /* private */ }
+
+impl&lt;W: std::io::Write&gt; Emitter&lt;W&gt; {
+    pub fn new(out: W) -&gt; Emitter&lt;W&gt;;
+    pub fn set_encoding(&amp;mut self, e: Encoding);
+    pub fn set_canonical(&amp;mut self, b: bool);
+    pub fn set_indent(&amp;mut self, n: u8);
+    pub fn set_width(&amp;mut self, n: u32);
+    pub fn set_unicode(&amp;mut self, b: bool);
+    pub fn set_break(&amp;mut self, b: LineBreak);
+
+    pub fn emit(&amp;mut self, event: Event&lt;&#39;_&gt;) -&gt; Result&lt;(), Error&gt;;
+    pub fn flush(&amp;mut self) -&gt; Result&lt;(), Error&gt;;
+    pub fn into_inner(self) -&gt; Result&lt;W, Error&gt;;
+}</code></pre>
+<h3 data-number="16.1.4" id="safe-libyaml-sysextern-c-symbols"><span class="header-section-number">16.1.4</span> <code>safe-libyaml-sys::extern "C"</code> symbols</h3>
+<pre><code>#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_initialize(
+    parser: *mut yaml_parser_t) -&gt; c_int;
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_delete(
+    parser: *mut yaml_parser_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_set_input_string(
+    parser: *mut yaml_parser_t,
+    input: *const c_uchar, size: size_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_set_input_file(
+    parser: *mut yaml_parser_t, file: *mut FILE);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_set_encoding(
+    parser: *mut yaml_parser_t, encoding: yaml_encoding_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_parser_parse(
+    parser: *mut yaml_parser_t, event: *mut yaml_event_t) -&gt; c_int;
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_event_delete(
+    event: *mut yaml_event_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_initialize(
+    emitter: *mut yaml_emitter_t) -&gt; c_int;
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_delete(
+    emitter: *mut yaml_emitter_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_set_output_string(
+    emitter: *mut yaml_emitter_t,
+    output: *mut c_uchar, size: size_t,
+    size_written: *mut size_t);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_set_output_file(
+    emitter: *mut yaml_emitter_t, file: *mut FILE);
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_emit(
+    emitter: *mut yaml_emitter_t, event: *mut yaml_event_t) -&gt; c_int;
+
+#[no_mangle] pub unsafe extern &quot;C&quot; fn yaml_emitter_flush(
+    emitter: *mut yaml_emitter_t) -&gt; c_int;
+
+#[no_mangle] pub extern &quot;C&quot; fn yaml_get_version_string()
+    -&gt; *const c_char;
+
+#[no_mangle] pub extern &quot;C&quot; fn yaml_get_version(
+    major: *mut c_int, minor: *mut c_int, patch: *mut c_int);</code></pre>
+<h2 data-number="16.2" id="workspace-layout-target"><span class="header-section-number">16.2</span> Workspace layout (target)</h2>
+<pre data-language=""><code>safe-libyaml/                         # cargo workspace root
+|- Cargo.toml                         # [workspace] members = [...]
+|- safe-libyaml/                      # the safe core crate
+|  |- Cargo.toml
+|  |- src/
+|  |  |- lib.rs                       # #![deny(unsafe_code)] etc.
+|  |  |- error.rs                     # Error, ErrorKind
+|  |  |- event.rs                     # Event&lt;&#39;a&gt;, OwnedEvent
+|  |  |- token.rs                     # pub(crate) Token&lt;&#39;a&gt;
+|  |  |- mark.rs                      # Mark
+|  |  |- encoding.rs                  # Encoding enum + detection
+|  |  |- parser/{mod,scanner,reader}.rs
+|  |  |- emitter/{mod,writer,style}.rs
+|  |  |- document.rs
+|  |  |- internal.rs
+|  |- tests/
+|  |  |- api_surface.rs
+|  |  |- yaml_test_suite.rs
+|  |- benches/parse_benchmark.rs
+|- safe-libyaml-sys/                  # the C ABI shim
+|  |- Cargo.toml                      # crate-type = [&quot;staticlib&quot;, &quot;cdylib&quot;]
+|  |- build.rs
+|  |- cbindgen.toml
+|  |- src/lib.rs                      # extern &quot;C&quot; exports
+|  |- include/yaml.h                  # generated (gitignored, regenerated)
+|- safe-libyaml-fuzz/                 # cargo-fuzz workspace
+|  |- fuzz_targets/{fuzz_parser,fuzz_emitter,fuzz_roundtrip}.rs
+|- safe-libyaml-bench/                # criterion benchmarks
+|  |- benches/{parse,emit,roundtrip}.rs</code></pre>
+<h2 data-number="16.3" id="agent-task-list"><span class="header-section-number">16.3</span> Agent task list</h2>
+<p>The tasks below use the project-mandated checkbox template:</p>
+<blockquote>
+<p><code>[ ] Agent: &lt;name&gt; </code><span class="math inline">\(\cdot\)</span><code> Task: &lt;verb-phrase&gt;</code><br />
+<code>Inputs: &lt;files&gt;</code><br />
+<code>Output: &lt;crate path / file&gt;</code><br />
+<code>Success: &lt;verifiable criterion&gt;</code><br />
+<code>Est: &lt;hours&gt;</code></p>
+</blockquote>
+<h3 data-number="16.3.1" id="agent-a2-scaffold-builder"><span class="header-section-number">16.3.1</span> Agent A2 — Scaffold Builder</h3>
+<div class="small">
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: bootstrap workspace</code><br />
+Inputs: empty repository, project README<br />
+Output: <code>Cargo.toml</code> (workspace), <code>rust-toolchain.toml</code>, <code>.gitignore</code><br />
+Success: <code>cargo metadata --no-deps</code> succeeds<br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: cargo new --lib safe-libyaml</code><br />
+Inputs: workspace bootstrapped<br />
+Output: <code>safe-libyaml/Cargo.toml</code>, <code>src/lib.rs</code><br />
+Success: <code>cargo check -p safe-libyaml</code> succeeds<br />
+Est: 0.25</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define crate-level lints</code><br />
+Inputs: <code>src/lib.rs</code><br />
+Output: <code>#![deny(unsafe_code, missing_docs, rust_2018_idioms)]</code>, <code>lints.toml</code><br />
+Success: <code>cargo check</code> clean; <code>cargo clippy</code> runs<br />
+Est: 0.25</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Mark struct</code><br />
+Inputs: knowledge-base mapping table<br />
+Output: <code>src/mark.rs</code> with <code>pub struct Mark { index: u64, line: u64, column: u64 }</code><br />
+Success: <code>Mark</code> is <code>Copy + Debug + Clone + Eq + Hash</code>; doctests for <code>ZERO</code><br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Encoding enum</code><br />
+Inputs: knowledge-base mapping; libyaml <code>yaml_encoding_t</code><br />
+Output: <code>src/encoding.rs</code> with <code>Any, Utf8, Utf16Le, Utf16Be</code><br />
+Success: <code>repr(u32)</code> matches C order; <code>Default</code> = <code>Any</code><br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Error type</code><br />
+Inputs: thiserror crate; libyaml <code>yaml_error_type_e</code><br />
+Output: <code>src/error.rs</code> with <code>Error</code>, <code>ErrorKind</code>, <code>Result</code><br />
+Success: <code>Error: Send + Sync + ’static</code>; variants match knowledge-base spec<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define ScalarStyle/SequenceStyle/MappingStyle</code><br />
+Inputs: libyaml style enums<br />
+Output: <code>src/event.rs</code> (style enums)<br />
+Success: <code>repr(u32)</code>; serde feature derives<br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt; enum</code><br />
+Inputs: this paper’s Section <a href="#sec:lifetimes-events" data-reference-type="ref" data-reference="sec:lifetimes-events">4</a> spec<br />
+Output: <code>src/event.rs</code> with <code>#[non_exhaustive] pub enum Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code><br />
+Success: all 11 variants present; <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> for scalar/anchor/tag fields; <code>cargo doc</code> renders cleanly<br />
+Est: 1.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define OwnedEvent and into_owned</code><br />
+Inputs: <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> defined<br />
+Output: <code>OwnedEvent</code>, <code>Event::into_owned</code> method<br />
+Success: <code>OwnedEvent: ’static + Send + Sync</code>; round-trip test passes<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define VersionDirective and TagDirective</code><br />
+Inputs: libyaml directive types<br />
+Output: <code>src/event.rs</code><br />
+Success: <code>TagDirective&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> contains <code>handle: Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code>, <code>prefix: Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code><br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define internal Token&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt; enum</code><br />
+Inputs: libyaml <code>yaml_token_type_t</code> (22 kinds)<br />
+Output: <code>src/token.rs</code> (pub(crate))<br />
+Success: 22 variants exhaustively named; not exposed in <code>lib.rs</code> re-exports<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Parser&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt; struct stub</code><br />
+Inputs: this paper’s Section <a href="#sec:ownership-streaming" data-reference-type="ref" data-reference="sec:ownership-streaming">3</a> spec<br />
+Output: <code>src/parser/mod.rs</code> with three constructors and <code>parse</code> stub<br />
+Success: <code>cargo check</code> passes; bodies are <code>todo!()</code><br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Emitter&lt;W: Write&gt; struct stub</code><br />
+Inputs: this paper’s API spec<br />
+Output: <code>src/emitter/mod.rs</code> with stubs<br />
+Success: <code>cargo check</code> passes; <code>Emitter</code> is generic over <code>W</code><br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define Document and Node types</code><br />
+Inputs: libyaml <code>yaml_document_t</code>, <code>yaml_node_t</code><br />
+Output: <code>src/document.rs</code><br />
+Success: <code>Document</code> owns <code>Vec&lt;Node&gt;</code>; <code>Node</code> is enum {Scalar, Sequence, Mapping}<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write API surface test</code><br />
+Inputs: scaffold complete<br />
+Output: <code>tests/api_surface.rs</code><br />
+Success: tests compile-check that every public type/function exists with the spec’d signature<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: bootstrap safe-libyaml-sys crate</code><br />
+Inputs: workspace<br />
+Output: <code>safe-libyaml-sys/Cargo.toml</code> (<code>crate-type = ["staticlib", "cdylib"]</code>), <code>src/lib.rs</code><br />
+Success: <code>cargo build -p safe-libyaml-sys</code> produces <code>libsafe_yaml.{a,so}</code><br />
+Est: 0.5</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: define #[repr(C)] FFI structs</code><br />
+Inputs: libyaml <code>yaml.h</code><br />
+Output: <code>safe-libyaml-sys/src/lib.rs</code> with <code>yaml_parser_t</code>, <code>yaml_emitter_t</code>, <code>yaml_event_t</code>, <code>yaml_mark_t</code>, <code>yaml_event_type_t</code>, etc.<br />
+Success: <code>std::mem::size_of</code> matches the C struct size on the host platform<br />
+Est: 2.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write extern "C" parser exports</code><br />
+Inputs: safe-libyaml Parser API; libyaml symbol set<br />
+Output: <code>yaml_parser_initialize</code>, <code>yaml_parser_delete</code>, <code>yaml_parser_set_input_string</code>, <code>yaml_parser_parse</code>, etc.<br />
+Success: <code>nm -D libsafe_yaml.so</code> contains all 80 expected <code>yaml_*</code> symbols<br />
+Est: 4.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write extern "C" emitter exports</code><br />
+Inputs: safe-libyaml Emitter API; libyaml symbol set<br />
+Output: <code>yaml_emitter_*</code> extern "C" exports<br />
+Success: <code>nm -D</code> contains all emitter symbols<br />
+Est: 3.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write cbindgen.toml</code><br />
+Inputs: this paper’s Section <a href="#sec:ffi" data-reference-type="ref" data-reference="sec:ffi">10</a><br />
+Output: <code>safe-libyaml-sys/cbindgen.toml</code><br />
+Success: <code>cbindgen --config cbindgen.toml -o yaml.h</code> produces a header that diffs cleanly against <code>libyaml/include/yaml.h</code> modulo whitespace/comments<br />
+Est: 2.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write build.rs to invoke cbindgen</code><br />
+Inputs: cbindgen.toml<br />
+Output: <code>safe-libyaml-sys/build.rs</code><br />
+Success: <code>cargo build</code> regenerates <code>include/yaml.h</code> on source change<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: A2 </code><span class="math inline">\(\cdot\)</span><code> Task: write ABI-parity CI check</code><br />
+Inputs: generated header; reference <code>libyaml/include/yaml.h</code>; <code>libyaml.so</code><br />
+Output: <code>.github/workflows/abi-parity.yml</code><br />
+Success: CI fails if <code>cbindgen</code> diff or <code>nm</code> symbol diff exceeds the documented allow-list<br />
+Est: 1.5</p>
+</div>
+<h3 data-number="16.3.2" id="agent-osg-to-rust-emitter"><span class="header-section-number">16.3.2</span> Agent OSG-to-Rust emitter</h3>
+<h4 data-number="16.3.2.1" id="what-is-the-osg"><span class="header-section-number">16.3.2.1</span> What is the OSG?</h4>
+<p>The <em>Ownership Semantic Graph</em> is a typed intermediate representation produced by the upstream Phase A1 analysis agent. Each node corresponds to a C function or struct field; each node carries (i) an inferred ownership class for every pointer parameter (<span class="sans-serif">Owning</span>, <span class="sans-serif">BorrowShared</span>, <span class="sans-serif">BorrowMut</span>, <span class="sans-serif">SharedOwnership</span>, or <span class="sans-serif">RawUnsafe</span>), (ii) inferred lifetime constraints between those parameters, and (iii) a confidence score for the inference. The OSG-to-Rust emitter consumes this graph and produces the Rust skeleton signatures into which Phase B agents will fill bodies. The OSG schema and the analysis that produces it are described in the companion paper <span class="citation" data-cites="long-c"></span>; for the purpose of this appendix the OSG can be treated as a typed protobuf input whose schema is fixed.</p>
+<div class="small">
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: load OSG protobuf</code><br />
+Inputs: <code>analysis/osg.pb</code> produced by Phase A1<br />
+Output: in-memory representation with one node per C function<br />
+Success: round-trip serialise/deserialise; node count matches function count from <code>ctags -R</code><br />
+Est: 2.0</p>
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: implement signature-emission rule for ownership classes</code><br />
+Inputs: ownership classification (Owning/BorrowShared/BorrowMut/SharedOwnership)<br />
+Output: function that maps OSG node <span class="math inline">\(\mapsto\)</span> Rust signature string<br />
+Success: golden tests over <span class="math inline">\(\geq 30\)</span> hand-classified libyaml functions agree with the manual port <code>libyaml-safer</code><br />
+Est: 4.0</p>
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: emit Rust skeleton (one stub per OSG node)</code><br />
+Inputs: signatures from previous task<br />
+Output: <code>safe-libyaml/src/parser/scanner.rs</code>, <code>reader.rs</code>, <code>api.rs</code>, <code>emitter.rs</code>, <code>loader.rs</code>, <code>dumper.rs</code> — all stubs with <code>todo!()</code> bodies<br />
+Success: <code>cargo check</code> passes; one stub per libyaml function (<span class="math inline">\(\sim\)</span>175 stubs)<br />
+Est: 3.0</p>
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: insert lifetime parameters from OSG region inference</code><br />
+Inputs: OSG region annotations on pointer parameters<br />
+Output: lifetime-annotated signatures, e.g. <code>fn scan(&amp;mut self, buf: &amp;</code><span class="math inline">\(\,&#39;\!a\)</span><code> [u8]) -&gt; ...</code><br />
+Success: 90% of inferred lifetimes match the manual port<br />
+Est: 5.0</p>
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: tag stubs with provenance comments</code><br />
+Inputs: OSG node IDs<br />
+Output: each stub prefixed with <code>/// libyaml: src/scanner.c:L123 (yaml_parser_scan)</code><br />
+Success: every stub has a non-empty provenance comment<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: OSG-emit </code><span class="math inline">\(\cdot\)</span><code> Task: emit module-level mapping doc</code><br />
+Inputs: OSG<br />
+Output: <code>docs/translation-map.md</code> listing C function <span class="math inline">\(\to\)</span> Rust signature<br />
+Success: every libyaml function appears<br />
+Est: 1.0</p>
+</div>
+<h3 data-number="16.3.3" id="agent-c4-idiom-polisher"><span class="header-section-number">16.3.3</span> Agent C4 — Idiom Polisher</h3>
+<div class="small">
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: configure pedantic clippy lint set</code><br />
+Inputs: <code>Cargo.toml</code><br />
+Output: <code>lints.toml</code>, <code>clippy.toml</code><br />
+Success: <code>cargo clippy -- -W clippy::pedantic -W clippy::nursery -D warnings</code> runs and emits the agent’s worklist<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: replace manual index loops with iterators</code><br />
+Inputs: scanner/parser/emitter source post-Phase B<br />
+Output: refactored modules<br />
+Success: <code>clippy::needless_range_loop</code> count drops to zero; tests still pass<br />
+Est: 4.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: collapse Option::unwrap chains to ? propagation</code><br />
+Inputs: source<br />
+Output: refactored<br />
+Success: <code>grep -c ’.unwrap()’ src/</code> below the agreed budget; <code>cargo test</code> passes<br />
+Est: 3.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: remove any unsafe blocks remaining in safe crate</code><br />
+Inputs: source post-Phase B<br />
+Output: <code>#![deny(unsafe_code)]</code> compiles clean<br />
+Success: zero unsafe in <code>safe-libyaml/src</code><br />
+Est: 4.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: add doc comments to every public item</code><br />
+Inputs: source<br />
+Output: doc-commented public API<br />
+Success: <code>#![deny(missing_docs)]</code> compiles; <code>cargo doc --no-deps</code> clean<br />
+Est: 4.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: add #[must_use] to all Result-returning fns</code><br />
+Inputs: source<br />
+Output: annotated<br />
+Success: <code>clippy::must_use_candidate</code> reports zero remaining<br />
+Est: 1.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: rename single-letter variables</code><br />
+Inputs: source (post c2rust often uses <code>i</code>, <code>p</code>, <code>c</code>)<br />
+Output: renamed<br />
+Success: <code>clippy::min_ident_chars</code> reports zero (with whitelist for indices in iterator chains)<br />
+Est: 2.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: switch String allocations to Cow at API boundary</code><br />
+Inputs: <code>Event&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>&gt;</code> draft<br />
+Output: <code>Cow&lt;</code><span class="math inline">\(\,&#39;\!a\)</span><code>, str&gt;</code> where appropriate<br />
+Success: zero-copy benchmark shows <span class="math inline">\(\geq 30\%\)</span> allocation reduction on plain-scalar input<br />
+Est: 3.0</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: add #[non_exhaustive] to public enums</code><br />
+Inputs: <code>Event</code>, <code>ErrorKind</code>, <code>Encoding</code><br />
+Output: annotated<br />
+Success: cargo-semver-checks reports the next minor as additive-only<br />
+Est: 0.5</p>
+<p><code>[ ] Agent: C4 </code><span class="math inline">\(\cdot\)</span><code> Task: review against libyaml-safer for readability parity</code><br />
+Inputs: both ports<br />
+Output: review notes; further refactors<br />
+Success: human reviewer judges parity in a sampled <span class="math inline">\(\geq 20\)</span> functions<br />
+Est: 6.0</p>
+</div>
+<h3 data-number="16.3.4" id="crate-layout-agent-umbrella"><span class="header-section-number">16.3.4</span> Crate-layout agent (umbrella)</h3>
+<div class="small">
+<p><code>[ ] Agent: Crate-Layout </code><span class="math inline">\(\cdot\)</span><code> Task: bootstrap safe-libyaml-fuzz</code><br />
+Inputs: workspace<br />
+Output: <code>safe-libyaml-fuzz/</code> with <code>cargo-fuzz</code> configured<br />
+Success: <code>cargo fuzz list</code> prints <code>fuzz_parser</code>, <code>fuzz_emitter</code>, <code>fuzz_roundtrip</code><br />
+Est: 1.0</p>
+<p><code>[ ] Agent: Crate-Layout </code><span class="math inline">\(\cdot\)</span><code> Task: bootstrap safe-libyaml-bench</code><br />
+Inputs: workspace<br />
+Output: <code>safe-libyaml-bench/</code> with criterion benches<br />
+Success: <code>cargo bench</code> runs three baseline benches<br />
+Est: 1.0</p>
+</div>
+<h2 data-number="16.4" id="module-dependency-diagram"><span class="header-section-number">16.4</span> Module dependency diagram</h2>
+<p>The following diagram shows the workspace’s module dependencies. Solid edges denote <code>use crate::</code>; dashed edges denote inter-crate <code>Cargo.toml</code> dependencies.</p>
+<div class="center">
+
+</div>
+<p><strong>Reading.</strong> The four “leaf” modules (<code>mark</code>, <code>encoding</code>, <code>error</code>, <code>token</code>) have no <code>safe-libyaml</code>-internal dependencies and are translated first (Phase B Wave 1). The middle row (<code>event</code>, <code>internal</code>, <code>document</code>) depends only on the leaves. The bottom rows (<code>reader</code>/<code>scanner</code>/<code>parser</code>, <code>writer</code>/<code>style</code>/<code>emitter</code>, <code>loader</code>/<code>dumper</code>) form the streaming pipeline. The three sister crates (<code>-sys</code>, <code>-fuzz</code>, <code>-bench</code>) depend on the safe core but never on each other.</p>
+<h2 data-number="16.5" id="reference-lints.toml"><span class="header-section-number">16.5</span> Reference <code>lints.toml</code></h2>
+<pre data-language=""><code># safe-libyaml/lints.toml -- consumed by C4 (Idiom Polisher)
+[lints.rust]
+unsafe_code = &quot;deny&quot;
+missing_docs = &quot;deny&quot;
+rust_2018_idioms = &quot;deny&quot;
+
+[lints.clippy]
+pedantic = { level = &quot;warn&quot;, priority = -1 }
+nursery  = { level = &quot;warn&quot;, priority = -1 }
+# Project-specific allows (justify each in PR description)
+module_name_repetitions = &quot;allow&quot;
+missing_errors_doc      = &quot;allow&quot;   # covered by Error type docs
+must_use_candidate      = &quot;warn&quot;
+needless_range_loop     = &quot;deny&quot;</code></pre>
+<h2 data-number="16.6" id="hand-off-to-phase-b"><span class="header-section-number">16.6</span> Hand-off to Phase B</h2>
+<p>The artifacts produced by the agents in this appendix — the workspace, the crate skeletons with <code>todo!()</code> bodies, the FFI shim with stub bodies delegating to the safe crate, and <code>cbindgen.toml</code> producing a parity header — form the input contract for Phase B (the per-function TRANSLATE-TEST-FIX loop) which is described in the companion <code>c-rust-transpiling</code> paper. Phase B agents replace each <code>todo!()</code> with a real implementation while preserving every type signature emitted by the OSG-to-Rust emitter, ensuring the type-contract discipline mandated by the supervisory <code>CLAUDE.md</code> rules.</p>
+<section id="footnotes" class="footnotes footnotes-end-of-document" role="doc-endnotes">
+<hr />
+<ol>
+<li id="fn1"><p><a href="https://github.com/dtolnay/unsafe-libyaml" class="uri">https://github.com/dtolnay/unsafe-libyaml</a><a href="#fnref1" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+<li id="fn2"><p><a href="https://github.com/simonask/libyaml-safer" class="uri">https://github.com/simonask/libyaml-safer</a><a href="#fnref2" class="footnote-back" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>

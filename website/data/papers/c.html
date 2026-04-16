@@ -1,0 +1,595 @@
+<h1 data-number="1" id="sec:intro"><span class="header-section-number">1</span> Introduction</h1>
+<p>The Ferrous Bridge pipeline is an AI-assisted toolchain whose stated objective is to convert security-critical <span class="nodecor"><span class="smallcaps">C</span></span> codebases into <em>safe</em> <span class="nodecor"><span class="smallcaps">Rust</span></span> crates — crates that compile under <code>rustc</code> with <code>#![deny(unsafe_code)]</code> outside narrowly scoped FFI shims, that pass under Miri’s stacked-borrows interpreter, and that survive at least <span class="math inline">\(10^{6}\)</span> differential fuzzing iterations against the original <span class="nodecor"><span class="smallcaps">C</span></span> reference. The first concrete proving ground is <code>libyaml</code>: ninety million transitive downloads of <code>serde_yaml</code> and its forks currently flow through <code>unsafe-libyaml</code> <span class="citation" data-cites="ferrousagent2026"></span>, the <code>c2rust</code> <span class="citation" data-cites="c2rust2025"></span> mechanical transpilation. Our goal is to publish <code>safe-libyaml</code> as a drop-in safe replacement.</p>
+<p>To produce safe <span class="nodecor"><span class="smallcaps">Rust</span></span> from <span class="nodecor"><span class="smallcaps">C</span></span> one cannot translate syntactically. Every <span class="nodecor"><span class="smallcaps">C</span></span> pointer arithmetic expression, every <code>int</code> return code, every <code>void *</code> callback context conceals a <em>contract</em> that the original author held only in their head. The contract specifies who owns the pointee, when it may be aliased, when it may be freed, what range of indices is in-bounds, and which return value transitions denote success. C’s standard does not require these contracts to be written down; the compiler does not check them; the cost is that the contracts are routinely violated and the violations become CVEs. This paper exists to make those contracts explicit so that an analysis agent (or a careful human) can re-state them in the <span class="nodecor"><span class="smallcaps">Rust</span></span> type system.</p>
+<p>The paper is structured as follows. <a href="#sec:absmachine" data-reference-type="ref+Label" data-reference="sec:absmachine">2</a> gives a small-step operational semantics for the fragment of <span class="nodecor"><span class="smallcaps">C</span></span> needed to talk about translation: lvalues, rvalues, sequence points, evaluation order, indeterminate values. <a href="#sec:ub" data-reference-type="ref+Label" data-reference="sec:ub">3</a> organises undefined behaviour into seven classes and gives, for each, the <span class="nodecor"><span class="smallcaps">Rust</span></span> feature that statically forbids the class. <a href="#sec:libyaml-idioms" data-reference-type="ref+Label" data-reference="sec:libyaml-idioms">4</a> catalogues the <code>libyaml</code> idiom set: every concrete pattern that an analysis agent will find in the source. <a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a> formalises a translation contract for each idiom: an inference rule that says “if this <span class="nodecor"><span class="smallcaps">C</span></span> idiom is observed and these side conditions are discharged, then the corresponding <span class="nodecor"><span class="smallcaps">Rust</span></span> construct is a refinement.” <a href="#sec:related" data-reference-type="ref+Label" data-reference="sec:related">8</a> surveys related work — KCC, CompCert, c2rust, the recent agentic transpilation literature. <a href="#sec:conclusion" data-reference-type="ref+Label" data-reference="sec:conclusion">10</a> ties the contributions back to the companion <span class="nodecor"><span class="smallcaps">Rust</span></span> and <code>c-rust-transpiling</code> papers. <a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a> is a development plan with twenty-nine checkbox tasks for the analysis-phase prototype agents that produce the CAB.</p>
+<h2 data-number="1.1" id="sec:preliminaries"><span class="header-section-number">1.1</span> Pipeline preliminaries: CAB, OSG, and the agent stages</h2>
+<p>Although this paper stands on its own as a reference on <span class="nodecor"><span class="smallcaps">C</span></span> semantics for translation, several artifact names recur and are best fixed up front. The Ferrous Bridge pipeline has five stages, of which the first two are relevant here.</p>
+<p><strong>Stage 1 (C Frontend Analysis)</strong> consumes <span class="nodecor"><span class="smallcaps">C</span></span> source files and produces the <em>C-Analysis Bundle (CAB)</em>: a Protocol-Buffers-serialised package containing per-translation-unit Clang ASTs, LLVM IR, control-flow graphs, the call graph, an Andersen-style points-to graph, use-def chains, and dynamic-trace summaries from sanitiser runs. The CAB is the typed input to Stage 2.</p>
+<p><strong>Stage 2 (Ownership Semantic Graph)</strong> consumes the CAB and emits the <em>Ownership Semantic Graph (OSG)</em>: a typed intermediate representation in which every C pointer parameter is annotated with one of five ownership classes (<span class="math inline">\(\mathsf{Own}\)</span>, <span class="math inline">\(\mathsf{Bor}^{\mathrm{shr}}\)</span>, <span class="math inline">\(\mathsf{Bor}^{\mathrm{mut}}\)</span>, <span class="math inline">\(\mathsf{Shar}\)</span>, <span class="math inline">\(\mathsf{Raw}\)</span>), a confidence score in <span class="math inline">\([0,1]\)</span>, and a <span class="nodecor"><span class="smallcaps">Rust</span></span> idiom hint (<code>Vec</code>-from-malloc-array, <code>String</code>-from-char-star, <code>Option</code>-from-nullable-pointer, etc.). The downstream translation engine (Stage 3) routes each function to either a fine-tuned model or to Claude based on the confidences.</p>
+<p>The translation contracts of <a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a> are the rule-set against which the OSG is built: an OSG entry is precisely the discharged or undischarged side condition of one of the contracts. The development plan of <a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a> is the build plan for the agents that produce the CAB and lift it to the OSG.</p>
+<h2 data-number="1.2" id="contribution"><span class="header-section-number">1.2</span> Contribution</h2>
+<p>The specific contributions of this paper are:</p>
+<ol>
+<li><p>A small-step operational semantics, restricted to the translation-relevant <span class="nodecor"><span class="smallcaps">C</span></span> fragment, in which sequence points are first-class and indeterminate values are explicit (<a href="#sec:absmachine" data-reference-type="ref+Label" data-reference="sec:absmachine">2</a>).</p></li>
+<li><p>A seven-class undefined-behaviour taxonomy, with each class mapped to the precise <span class="nodecor"><span class="smallcaps">Rust</span></span> type-system feature that statically rules it out (<a href="#sec:ub" data-reference-type="ref+Label" data-reference="sec:ub">3</a>).</p></li>
+<li><p>A complete catalogue of the <code>libyaml</code> idiom set, lifted from five core source files in <code>libyaml</code>—|yaml_private.h|, |api.c|, |scanner.c|, |parser.c|, and |emitter.c|—with annotated <span class="nodecor"><span class="smallcaps">C</span></span> excerpts (<a href="#sec:libyaml-idioms" data-reference-type="ref+Label" data-reference="sec:libyaml-idioms">4</a>).</p></li>
+<li><p>Eleven <em>translation contracts</em>, one per <code>libyaml</code> idiom, each a typed refinement statement together with its proof obligation (<a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a>).</p></li>
+<li><p>A twenty-nine task development plan for the analysis-phase agents that build the C-Analysis Bundle (<a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a>).</p></li>
+</ol>
+<h2 data-number="1.3" id="notation"><span class="header-section-number">1.3</span> Notation</h2>
+<p>We write <span class="math inline">\(\langle e,\ \sigma\rangle\)</span> for a <span class="nodecor"><span class="smallcaps">C</span></span> machine configuration consisting of an expression <span class="math inline">\(e\)</span> and a store <span class="math inline">\(\sigma: \ell\rightharpoonup v\)</span>. The relation <span class="math inline">\(\langle e,\ \sigma\rangle \longrightarrow\langle e&#39;,\ \sigma&#39;\rangle\)</span> is small-step reduction. The relation <span class="math inline">\(e_1 \prec_{\mathrm{sb}}e_2\)</span> is <em>sequenced before</em> in the sense of ISO C18 §5.1.2.3p3. We write <span class="math inline">\(e \sqsubseteq_{T} e&#39;\)</span> for <em>semantic refinement at type <span class="math inline">\(T\)</span></em>: every behaviour of the refining program is a permitted behaviour of the refined program. Translation is written as a function <span class="math inline">\(\mathcal{T}: \mathcal{C}\to \mathcal{R}\)</span>, where <span class="math inline">\(\mathcal{C}\)</span> is a fragment of well-defined <span class="nodecor"><span class="smallcaps">C</span></span> programs and <span class="math inline">\(\mathcal{R}\)</span> is safe <span class="nodecor"><span class="smallcaps">Rust</span></span>.</p>
+<h1 data-number="2" id="sec:absmachine"><span class="header-section-number">2</span> The ISO C18 Abstract Machine</h1>
+<h2 data-number="2.1" id="why-we-need-a-formal-semantics"><span class="header-section-number">2.1</span> Why we need a formal semantics</h2>
+<p>Idiomatic <span class="nodecor"><span class="smallcaps">C</span></span> translation work in industry usually proceeds informally: the engineer reads the <span class="nodecor"><span class="smallcaps">C</span></span>, mentally simulates execution, and writes <span class="nodecor"><span class="smallcaps">Rust</span></span>. Mental simulation is unsound for <span class="nodecor"><span class="smallcaps">C</span></span> for three reasons. First, the standard licenses many evaluation orders and the ones that occur in production are compiler- and optimisation-flag dependent. Second, the standard <em>licenses arbitrary behaviour</em> on undefined-behaviour-tripping programs, and modern compilers exploit this license for optimisation; the actually-observed behaviour of a <span class="nodecor"><span class="smallcaps">C</span></span> program is therefore not a sound reference for translation. Third, <span class="nodecor"><span class="smallcaps">C</span></span> pointers carry implicit metadata — provenance, alignment, lifetime — that has no syntactic representation in the source. We need a formal model where these are explicit.</p>
+<p>We do not give a full semantics; the canonical reference is the KCC executable semantics of Ellison and Roşu <span class="citation" data-cites="ellison2012"></span>. We give the minimum needed to talk about translation contracts.</p>
+<h2 data-number="2.2" id="syntax-of-the-translation-fragment"><span class="header-section-number">2.2</span> Syntax of the translation fragment</h2>
+<p><span class="math display">\[\begin{align*}
+\tau\;&amp;::=\; \mathtt{int} \mid \mathtt{char} \mid \tau\,* \mid \mathtt{struct}\ s \mid \mathtt{union}\ u \mid \mathtt{void} \\
+e\;&amp;::=\; n \mid x \mid \&amp;e\mid {*}e\mid e_1 \mathbin{\mathit{op}} e_2 \mid e_1 = e_2 \mid e_1[e_2] \mid e.f \mid e\to f \\
+&amp;\quad\mid\;\; (\tau)e\mid e_1(e_2,\ldots) \mid \mathtt{sizeof}(\tau) \mid e_1, e_2 \\
+\mathit{stmt} \;&amp;::=\; e; \mid \mathtt{return}\ e; \mid \mathtt{if}\ (e)\ s_1\ \mathtt{else}\ s_2 \mid \mathtt{while}\ (e)\ s \mid \{ \mathit{stmt}^* \}
+\end{align*}\]</span></p>
+<p>The fragment omits goto, switch, and bit-fields; <code>libyaml</code> uses these only sparingly and they pose no novel translation difficulty.</p>
+<h2 data-number="2.3" id="stores-locations-values"><span class="header-section-number">2.3</span> Stores, locations, values</h2>
+<div class="definition">
+<p><strong>Definition 1</strong> (Store).  A <em>store</em> is a partial map <span class="math inline">\(\sigma: \ell\times \mathbb{N} \rightharpoonup v\cup \{\mathsf{Indet}\}\)</span>, indexed by a base location <span class="math inline">\(\ell\)</span> and a byte offset. The byte at offset <span class="math inline">\(i\)</span> of object <span class="math inline">\(\ell\)</span> may be a determinate value or the distinguished tag <span class="math inline">\(\mathsf{Indet}\)</span> (“indeterminate”), modelling fresh <code>malloc</code>-returned memory or uninitialised stack slots.</p>
+</div>
+<div id="def:provenance" class="definition">
+<p><strong>Definition 2</strong> (Provenance-bearing pointer value).  A pointer value is a triple <span class="math inline">\((\ell, i, p)\)</span> where <span class="math inline">\(\ell\in \ell\)</span> is the base object, <span class="math inline">\(i \in \mathbb{Z}\)</span> is the offset in bytes from the base, and <span class="math inline">\(p \in \{\mathsf{Live}, \mathsf{Dead}\}\)</span> is the <em>provenance</em> of the object (whether the object is currently allocated). A pointer with <span class="math inline">\(p = \mathsf{Dead}\)</span> traps any access.</p>
+</div>
+<h2 data-number="2.4" id="reading-indeterminate-bytes-is-undefined"><span class="header-section-number">2.4</span> Reading indeterminate bytes is undefined</h2>
+<div id="thm:indet-ub" class="theorem">
+<p><strong>Theorem 3</strong> (ISO C18 §6.2.6.1p5, simplified).  <em>If <span class="math inline">\(\langle e,\ \sigma\rangle \longrightarrow^* \langle *\!(\ell, i, \mathsf{Live}),\ \sigma&#39;\rangle\)</span> and there exists a byte offset <span class="math inline">\(j \in [i, i+\mathit{sizeof}(\tau))\)</span> with <span class="math inline">\(\sigma&#39;(\ell, j) = \mathsf{Indet}\)</span>, and <span class="math inline">\(\tau\)</span> is not <span class="math inline">\(\mathtt{char}\)</span>, <span class="math inline">\(\mathtt{signed\ char}\)</span>, or <span class="math inline">\(\mathtt{unsigned\ char}\)</span>, then the program exhibits undefined behaviour.</em></p>
+</div>
+<p>The translation consequence: any <span class="nodecor"><span class="smallcaps">C</span></span> struct allocated by <code>malloc</code> (rather than <code>calloc</code>) and read field-wise before being initialised is UB. <span class="nodecor"><span class="smallcaps">Rust</span></span> forbids this statically: every field of a <code>struct</code> value must be initialised at construction.</p>
+<h2 data-number="2.5" id="sequence-points-and-the-sequenced-before-relation"><span class="header-section-number">2.5</span> Sequence points and the sequenced-before relation</h2>
+<div class="definition">
+<p><strong>Definition 4</strong> (Sequenced-before).  The relation <span class="math inline">\(\prec_{\mathrm{sb}}\)</span> is the smallest partial order over expression evaluations satisfying the rules of ISO C18 §6.5: the left operand of <code>&amp;&amp;</code>, <code>||</code>, <code>,</code>, and <code>?:</code> is sequenced before the right; the function-call operand expressions are sequenced before the call; assignment is sequenced after both operands. Operands of arithmetic and most other binary operators are <em>not</em> ordered.</p>
+</div>
+<div id="thm:unseq-ub" class="theorem">
+<p><strong>Theorem 5</strong> (Unsequenced modification is UB, ISO C18 §6.5p2).  <em>If two side effects on the same scalar object are <em>unsequenced</em> (neither <span class="math inline">\(\prec_{\mathrm{sb}}\)</span> the other), the program exhibits undefined behaviour.</em></p>
+</div>
+<p>The classic example <code>i = i++</code> is undefined for this reason. <span class="nodecor"><span class="smallcaps">Rust</span></span> statically forbids this: the borrow checker prevents two simultaneous <code>&amp;mut</code> references to the same place.</p>
+<h2 data-number="2.6" id="small-step-rules-selected"><span class="header-section-number">2.6</span> Small-step rules (selected)</h2>
+<p>We give the rules that matter for the translation contracts in <a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a>. Two simplifications relative to a fully-formal C semantics deserve note. First, we conflate the lvalue/rvalue distinction in the rules below: <span class="smallcaps">Var</span> produces the stored value directly, while <span class="smallcaps">Assign</span> re-evaluates the LHS as a location. A complete semantics would have separate evaluation judgements for lvalues and rvalues with an explicit lvalue-to-rvalue conversion (ISO C18 §6.3.2.1); the conflation does not affect the translation contracts that follow. Second, we omit type promotion and the integer rank rules (§6.3.1) for arithmetic expressions; these are orthogonal to the UB classes that drive translation.</p>
+<div class="mathpar">
+
+</div>
+<p>The key features of these rules follow ISO C18 §6.5.6p8 precisely. Pointer formation is licensed throughout the closed interval <span class="math inline">\([0, \mathit{sizeof}(\ell)]\)</span> — one byte past the end of the allocation is a <em>valid</em> pointer value that may be formed and compared, but not dereferenced. Rule <span class="smallcaps">PtrAdd-InBounds</span> captures this: the upper bound is the inclusive <span class="math inline">\(\leq\)</span>. Rule <span class="smallcaps">Deref-OnePastEnd</span> singles out the dereference of a one-past-the-end pointer as the UB case; merely holding such a pointer is fine. Rule <span class="smallcaps">PtrAdd-OOB</span> traps when arithmetic would land strictly outside the closed interval. Dereferencing a <code>Dead</code> pointer traps to <span class="math inline">\(\bot_{\mathit{ub}}\)</span>; reading an <span class="math inline">\(\mathsf{Indet}\)</span> byte (rule omitted; same shape) traps to <span class="math inline">\(\bot_{\mathit{ub}}\)</span>. These four classes capture buffer-overflow, use-after-free, and uninitialised-read CVEs that account for the majority of exploitable bugs in <code>libyaml</code>, <code>libexpat</code>, <code>libpng</code>, and <code>libxml2</code>.</p>
+<h2 data-number="2.7" id="refinement-to-rust"><span class="header-section-number">2.7</span> Refinement to <span class="nodecor"><span class="smallcaps">Rust</span></span></h2>
+<div id="def:trace" class="definition">
+<p><strong>Definition 6</strong> (Observable trace).  For a program <span class="math inline">\(P\)</span> on input <span class="math inline">\(x\)</span>, the <em>observable trace</em> <span class="math inline">\(\tau(P, x)\)</span> is the (possibly infinite) sequence of externally visible events: I/O calls (with arguments), the final return value (if the program terminates), and one of the marker events <span class="math inline">\(\bot_{\mathit{ub}}\)</span> (UB encountered) or <span class="math inline">\(\bot_{\mathit{err}}\)</span> (a defined error reported through the language’s error mechanism). Internal memory operations are not observable.</p>
+</div>
+<div id="def:refines" class="definition">
+<p><strong>Definition 7</strong> (Translation refinement).  A translation <span class="math inline">\(\mathcal{T}(P) = Q\)</span> is a <em>refinement at observation type <span class="math inline">\(O\)</span></em> if for every input <span class="math inline">\(x\)</span>:</p>
+<ol>
+<li><p>if <span class="math inline">\(\bot_{\mathit{ub}} \notin \tau(P, x)\)</span>, then <span class="math inline">\(\pi_{O}(\tau(Q, x)) = \pi_{O}(\tau(P, x))\)</span>; and</p></li>
+<li><p>if <span class="math inline">\(\bot_{\mathit{ub}} \in \tau(P, x)\)</span>, then <span class="math inline">\(\tau(Q, x)\)</span> may be any trace at all, including <span class="math inline">\(\bot_{\mathit{err}}\)</span> (returning a defined <code>Error</code>) or any well-defined I/O sequence followed by termination.</p></li>
+</ol>
+<p>The projection <span class="math inline">\(\pi_O\)</span> abstracts away semantically-irrelevant differences such as the choice of memory allocator (<code>malloc</code> vs. <code>Vec::push</code>) or the internal layout of an <code>enum</code>.</p>
+</div>
+<p>This definition follows the standard refinement notion of verified compilation <span class="citation" data-cites="leroy2009"></span>: the refining program may have <em>strictly fewer</em> behaviours than the refined program on every input. The asymmetry on UB inputs is intentional. We refuse to require that <span class="math inline">\(Q\)</span> reproduce <span class="math inline">\(P\)</span>’s behaviour on inputs where <span class="math inline">\(P\)</span> is undefined: such reproduction would preserve compiler-exploitable assumptions and would amount to translating bugs faithfully. We adopt this orientation throughout the paper: the goal of the pipeline is to maximise the number of implicit C invariants that are promoted to compile-time enforcement <span class="citation" data-cites="long2026c2rust"></span>, while remaining strictly conservative on UB inputs.</p>
+<h1 data-number="3" id="sec:ub"><span class="header-section-number">3</span> Undefined Behaviour Taxonomy</h1>
+<p>The ISO C18 standard enumerates more than two hundred undefined behaviours. For translation purposes we collapse them into seven classes, chosen so that each is statically ruled out by a single <span class="nodecor"><span class="smallcaps">Rust</span></span> feature.</p>
+<h2 data-number="3.1" id="class-ub1-spatial-memory-safety"><span class="header-section-number">3.1</span> Class UB1: Spatial memory safety</h2>
+<p><strong>Examples:</strong> buffer overread/overwrite, OOB pointer arithmetic, stack overflow.<br />
+<strong>C source:</strong> <code>*(p + i)</code> when <span class="math inline">\(i \geq \mathit{sizeof}(\mathtt{*}p)/\mathtt{sizeof}(\mathtt{*}p)\)</span>; <code>strcpy</code> into a buffer too small.<br />
+<strong>Rust feature:</strong> slice indexing <code>s[i]</code> which panics on OOB; the borrow-checked <code>&amp;[T]</code> and <code>&amp;mut [T]</code> carry length at the type level.<br />
+<strong>Defining CVE class for <code>libyaml</code>:</strong> the historical heap overflows in scalar scanning. The <code>yaml_string_t</code> triple <span class="math inline">\(\{\texttt{start}, \texttt{end}, \texttt{pointer}\}\)</span> has no compiler-enforceable guarantee that <code>pointer</code> stays within <span class="math inline">\(\texttt{[start}, \texttt{end]}\)</span>; the equivalent <code>Vec&lt;u8&gt;</code> carries length statically, and indexing is checked.</p>
+<h2 data-number="3.2" id="class-ub2-temporal-memory-safety"><span class="header-section-number">3.2</span> Class UB2: Temporal memory safety</h2>
+<p><strong>Examples:</strong> use-after-free, double-free, dangling reference.<br />
+<strong>C source:</strong> <code>free(p); use(p);</code> or <code>free(p); free(p);</code>.<br />
+<strong>Rust feature:</strong> ownership: a value has exactly one owner; <code>drop</code> runs at scope end; the borrow checker prevents reference outliving the referent.<br />
+<strong>Translation note:</strong> the <code>STACK_DEL</code> and <code>STRING_DEL</code> macros free the buffer and zero the pointers — a manual workaround for use-after-free that becomes automatic in <span class="nodecor"><span class="smallcaps">Rust</span></span>.</p>
+<h2 data-number="3.3" id="class-ub3-type-based-aliasing-tbaa"><span class="header-section-number">3.3</span> Class UB3: Type-based aliasing (TBAA)</h2>
+<p><strong>Examples:</strong> accessing the same storage through pointers of unrelated effective types; classic <code>int *</code> and <code>float *</code> aliasing.<br />
+<strong>C source:</strong> <code>*(int *)&amp;f</code> where <code>f</code> is <code>float</code>.<br />
+<strong>Rust feature:</strong> <code>&amp;T</code> and <code>&amp;mut T</code> encode aliasing rules in the type system; <code>transmute</code> requires <code>unsafe</code>; LLVM’s <code>noalias</code> metadata is licensed soundly because the borrow checker has discharged it.<br />
+<strong>Translation note:</strong> <code>libyaml</code>’s scanner reads ahead into the parser’s buffer through pointers that alias the same storage; the translation contract (<a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a>) replaces this with explicit slice borrows.</p>
+<h2 data-number="3.4" id="class-ub4-signed-integer-overflow"><span class="header-section-number">3.4</span> Class UB4: Signed integer overflow</h2>
+<p><strong>Examples:</strong> <code>INT_MAX + 1</code>; left shift past the type width; division of <code>INT_MIN</code> by <span class="math inline">\(-1\)</span>.<br />
+<strong>C source:</strong> <code>int n = a + b;</code> when <span class="math inline">\(a + b &gt; \mathtt{INT\_MAX}\)</span>.<br />
+<strong>Rust feature:</strong> <code>i32::checked_add</code>, <code>wrapping_add</code>, <code>overflowing_add</code>; in debug builds, plain <code>+</code> panics on overflow; in release, two’s-complement wrap.<br />
+<strong>Translation note:</strong> libyaml computes <code>capacity * 2</code> during <code>STACK_EXTEND</code> which on 32-bit systems can overflow <code>size_t</code> on a sufficiently large input. The <span class="nodecor"><span class="smallcaps">Rust</span></span> translation must use <code>checked_mul</code> and report an error.</p>
+<h2 data-number="3.5" id="class-ub5-unsequenced-modification"><span class="header-section-number">3.5</span> Class UB5: Unsequenced modification</h2>
+<p><strong>Examples:</strong> <code>i = i++</code>; <code>a[i] = i++</code>; passing <code>f(i, i++)</code>.<br />
+<strong>C source:</strong> two side effects on the same scalar with no sequence point between.<br />
+<strong>Rust feature:</strong> aliasing-XOR-mutability: at most one <code>&amp;mut</code> live at a time, never simultaneous with <code>&amp;</code>.<br />
+<strong>Translation note:</strong> <code>libyaml</code> uses macro-expanded post-increments inside expressions; the macro expansions must be lifted to statements during translation.</p>
+<h2 data-number="3.6" id="class-ub6-indeterminate-values-and-uninitialised-reads"><span class="header-section-number">3.6</span> Class UB6: Indeterminate values and uninitialised reads</h2>
+<p><strong>Examples:</strong> reading from <code>malloc</code>-returned memory before writing.<br />
+<strong>C source:</strong> <code>int *p = malloc(sizeof *p); printf("%d", *p);</code><br />
+<strong>Rust feature:</strong> all fields of a <code>struct</code> value must be initialised at construction; invoking |MaybeUninit&lt;T&gt;::assume_init| requires <code>unsafe</code>.<br />
+<strong>Translation note:</strong> In <code>libyaml</code>, <code>yaml_parser_initialize</code> zeroes the parser with <code>memset</code>. The <span class="nodecor"><span class="smallcaps">Rust</span></span> translation instead provides a <code>Default</code> implementation or an explicit constructor that initialises every field.</p>
+<h2 data-number="3.7" id="class-ub7-concurrent-data-races"><span class="header-section-number">3.7</span> Class UB7: Concurrent data races</h2>
+<p><strong>Examples:</strong> unsynchronised read-write or write-write to the same memory from two threads.<br />
+<strong>C source:</strong> <code>*p++</code> from one thread, <code>*p++</code> from another, no atomics, no mutex.<br />
+<strong>Rust feature:</strong> <code>Send</code> and <code>Sync</code> marker traits; sharing across threads requires <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> or <code>Arc&lt;RwLock&lt;T&gt;&gt;</code>; types that are not <code>Sync</code> (such as <code>Cell&lt;T&gt;</code>) cannot be shared.<br />
+<strong>Translation note:</strong> libyaml is single-threaded; this class is mostly defensive.</p>
+<h2 data-number="3.8" id="tabular-summary"><span class="header-section-number">3.8</span> Tabular summary</h2>
+<p><a href="#tab:ub-mapping" data-reference-type="ref+Label" data-reference="tab:ub-mapping">1</a> summarises the seven classes and their <span class="nodecor"><span class="smallcaps">Rust</span></span> preventions.</p>
+<div id="tab:ub-mapping">
+<table>
+<caption>Mapping of <span class="nodecor"><span class="smallcaps">C</span></span> undefined-behaviour classes to the <span class="nodecor"><span class="smallcaps">Rust</span></span> feature that statically forbids each.</caption>
+<thead>
+<tr>
+<th style="text-align: left;"><strong>Class</strong></th>
+<th style="text-align: left;"><strong>C source</strong></th>
+<th style="text-align: left;"><strong><span class="nodecor"><span class="smallcaps">Rust</span></span> prevention</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">UB1 spatial</td>
+<td style="text-align: left;"><code>*(p + n)</code> OOB</td>
+<td style="text-align: left;">checked indexing on <code>&amp;[T]</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">UB2 temporal</td>
+<td style="text-align: left;"><code>free(p); *p</code></td>
+<td style="text-align: left;">ownership, <code>drop</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">UB3 TBAA</td>
+<td style="text-align: left;">punning casts</td>
+<td style="text-align: left;"><code>&amp;T</code> / <code>&amp;mut T</code> typing</td>
+</tr>
+<tr>
+<td style="text-align: left;">UB4 signed overflow</td>
+<td style="text-align: left;"><code>INT_MAX + 1</code></td>
+<td style="text-align: left;"><code>checked_add</code>, debug panic</td>
+</tr>
+<tr>
+<td style="text-align: left;">UB5 unsequenced</td>
+<td style="text-align: left;"><code>i = i++</code></td>
+<td style="text-align: left;"><span class="math inline">\(\&amp;\)</span>-XOR-<span class="math inline">\(\&amp;\)</span><code>mut</code> discipline</td>
+</tr>
+<tr>
+<td style="text-align: left;">UB6 indeterminate</td>
+<td style="text-align: left;"><code>malloc</code> then read</td>
+<td style="text-align: left;">full-field initialisation</td>
+</tr>
+<tr>
+<td style="text-align: left;">UB7 race</td>
+<td style="text-align: left;">unsync threaded access</td>
+<td style="text-align: left;"><code>Send</code>, <code>Sync</code>, <code>Mutex</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h1 data-number="4" id="sec:libyaml-idioms"><span class="header-section-number">4</span> C Idioms Relevant to libyaml and Similar Libraries</h1>
+<p>This section presents every recurring <span class="nodecor"><span class="smallcaps">C</span></span> pattern that an analysis agent will find in <code>libyaml</code>, plus one closely-related pattern (<code>setjmp</code>/<code>longjmp</code>, idiom I11) that does not occur in <code>libyaml</code> itself but does occur in adjacent translation targets such as <code>libpng</code>; we include it because it is the limit case against which our framework’s handling must be measured. The catalogue is exhaustive for <code>libyaml</code>: every CAB (<a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a>) entry for a <code>libyaml</code> function classifies into one or more of idioms I1–I10.</p>
+<h2 data-number="4.1" id="idiom:string"><span class="header-section-number">4.1</span> Idiom I1: The yaml_string_t triple</h2>
+<pre style="cstyle" data-caption="From \texttt{yaml\_private.h}"><code>typedef struct {
+    yaml_char_t *start;   /* beginning of allocated buffer */
+    yaml_char_t *end;     /* one past end of allocated buffer */
+    yaml_char_t *pointer; /* current cursor position */
+} yaml_string_t;</code></pre>
+<p>The triple manually encodes <span class="math inline">\(\mathit{capacity} = \texttt{end} - \texttt{start}\)</span>, <span class="math inline">\(\mathit{position} = \texttt{pointer} - \texttt{start}\)</span>, and <span class="math inline">\(\mathit{remaining} = \texttt{end} - \texttt{pointer}\)</span>. The invariant <span class="math inline">\(\texttt{start} \leq \texttt{pointer} \leq \texttt{end}\)</span> is the programmer’s responsibility; nothing in the type system enforces it. Every read through <code>*pointer</code> or <code>*(pointer + k)</code> risks UB1.</p>
+<h2 data-number="4.2" id="idiom:containers"><span class="header-section-number">4.2</span> Idiom I2: The STRING_*, STACK_*, QUEUE_* macro families</h2>
+<pre style="cstyle"><code>#define STRING_INIT(context, string, size)                              \
+    (((string).start = yaml_malloc(size)) ?                             \
+        ((string).pointer = (string).start,                             \
+         (string).end = (string).start + (size),                        \
+         memset((string).start, 0, (size)),                             \
+         1) :                                                           \
+        ((context)-&gt;error = YAML_MEMORY_ERROR, 0))
+
+#define STRING_EXTEND(context, string)                                  \
+    ((((string).pointer + 5 &lt; (string).end)                             \
+        || yaml_string_extend(&amp;(string).start,                          \
+            &amp;(string).pointer, &amp;(string).end)) ?                        \
+         1 :                                                            \
+         ((context)-&gt;error = YAML_MEMORY_ERROR, 0))
+
+#define STACK_INIT(context, stack, size)        /* analogous */
+#define STACK_PUSH(context, stack, value)       /* analogous */
+#define STACK_POP(context, stack)               /* analogous */
+#define QUEUE_INIT(context, queue, size)        /* ring buffer */
+#define ENQUEUE(context, queue, value)          /* analogous */
+#define DEQUEUE(context, queue)                 /* analogous */</code></pre>
+<p>The macro families fuse pointer arithmetic, error handling (set the parser’s <code>error</code> field), and dynamic allocation. <code>INITIAL_STACK_SIZE = 16</code>; <code>STACK_PUSH</code> doubles capacity via <code>realloc</code> when full. The family expands inline at every call site, which makes the code visually complex and trivially defeats most cross-function analysis.</p>
+<h2 data-number="4.3" id="idiom:intbool"><span class="header-section-number">4.3</span> Idiom I3: integer-as-bool return convention</h2>
+<pre style="cstyle"><code>int yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event);
+/* returns 1 on success, 0 on failure; the error is in parser-&gt;error */</code></pre>
+<p>Every <code>libyaml</code> parser/emitter function returns <code>int</code> where 1 means success and 0 means failure. The error itself is stored in the parser/emitter struct as the field <code>error</code>, with the human-readable message in <code>problem</code> and the location in <code>problem_mark</code>. Callers who forget the <code>if (!yaml_parser_parse(&amp;p, &amp;e)) goto error;</code> pattern silently process garbage.</p>
+<h2 data-number="4.4" id="idiom:outparam"><span class="header-section-number">4.4</span> Idiom I4: output-parameter convention</h2>
+<p>The return type carries the success bit; the actual produced value is delivered via an out-parameter. The caller pre-allocates an <code>yaml_event_t</code> on the stack and passes its address. The pattern arose because C lacks tuple returns and because <code>yaml_event_t</code> is large (<span class="math inline">\(\approx 100\)</span> bytes) so returning by value would copy.</p>
+<h2 data-number="4.5" id="idiom:tagged"><span class="header-section-number">4.5</span> Idiom I5: the yaml_event_t tagged union</h2>
+<pre style="cstyle"><code>typedef struct yaml_event_s {
+    yaml_event_type_t type;
+    union {
+        struct { yaml_encoding_t encoding; }                       stream_start;
+        struct { yaml_version_directive_t *version_directive;
+                 yaml_tag_directive_t    *tag_directives_start;
+                 yaml_tag_directive_t    *tag_directives_end;
+                 int                       implicit; }             document_start;
+        struct { int implicit; }                                   document_end;
+        struct { yaml_char_t *anchor; }                            alias;
+        struct { yaml_char_t *anchor;
+                 yaml_char_t *tag;
+                 yaml_char_t *value;
+                 size_t       length;
+                 int          plain_implicit;
+                 int          quoted_implicit;
+                 yaml_scalar_style_t style; }                      scalar;
+        struct { yaml_char_t *anchor; yaml_char_t *tag;
+                 int implicit; yaml_sequence_style_t style; }      sequence_start;
+        struct { yaml_char_t *anchor; yaml_char_t *tag;
+                 int implicit; yaml_mapping_style_t style; }       mapping_start;
+    } data;
+    yaml_mark_t start_mark;
+    yaml_mark_t end_mark;
+} yaml_event_t;</code></pre>
+<p>The discriminant <code>type</code> is held alongside the <code>union data</code>. Reading a field of <code>data.scalar</code> when <code>type != YAML_SCALAR_EVENT</code> is UB6 (the bytes are technically determinate after the producer wrote them, but the type used to read is wrong, so this is also a TBAA UB3 violation). The <span class="nodecor"><span class="smallcaps">Rust</span></span> translation uses an enum, fusing the tag and the data into a single ADT.</p>
+<h2 data-number="4.6" id="idiom:alloc"><span class="header-section-number">4.6</span> Idiom I6: custom allocator hooks</h2>
+<pre style="cstyle"><code>typedef void *(*yaml_malloc_t)(void *data, size_t size);
+typedef void *(*yaml_realloc_t)(void *data, void *ptr, size_t size);
+typedef void  (*yaml_free_t)(void *data, void *ptr);
+
+void yaml_parser_set_memory_handler(yaml_parser_t *parser,
+        yaml_malloc_t  malloc,
+        yaml_realloc_t realloc,
+        yaml_free_t    free,
+        void          *data);</code></pre>
+<p>The parser/emitter struct holds three function pointers and a <code>void *data</code> context. The indirection allows callers to use a private arena, but the <code>void *</code> loses all type information, so any miscast inside the callback is silently UB3.</p>
+<h2 data-number="4.7" id="idiom:alias"><span class="header-section-number">4.7</span> Idiom I7: scanner-into-parser buffer aliasing</h2>
+<p>The scanner reads bytes into the parser’s input buffer (<code>parser-&gt;buffer</code>) and exposes a cursor (<code>parser-&gt;buffer.pointer</code>) into that same buffer. Token productions take <em>slices</em> into the buffer that must remain valid until the token is consumed. The scanner can also extend the buffer (<code>yaml_parser_update_buffer</code>), which may <code>realloc</code> and invalidate any outstanding slices. There is no compiler-checked guarantee that no slice is outstanding at the time of the <code>realloc</code>; the implementation simply assumes it.</p>
+<h2 data-number="4.8" id="idiom:null"><span class="header-section-number">4.8</span> Idiom I8: nullable optional pointers</h2>
+<pre style="cstyle"><code>yaml_char_t *anchor;  /* NULL means no anchor */
+yaml_char_t *tag;     /* NULL means no tag */</code></pre>
+<p>Optional fields are encoded by null pointers. A consumer who forgets the <code>if (anchor)</code> guard dereferences NULL (UB2). The <span class="nodecor"><span class="smallcaps">Rust</span></span> translation uses <code>Option&lt;String&gt;</code>.</p>
+<h2 data-number="4.9" id="idiom:error"><span class="header-section-number">4.9</span> Idiom I9: ambient error state in the parser</h2>
+<pre style="cstyle"><code>struct yaml_parser_s {
+    yaml_error_type_t error;
+    const char       *problem;
+    size_t            problem_offset;
+    int               problem_value;
+    yaml_mark_t       problem_mark;
+    /* ... thirty more fields ... */
+};</code></pre>
+<p>Errors are not returned; they are <em>stashed</em> in the parser. The function returns 0 to signal that an error has been stashed. This is action-at-a-distance: the caller must look at the right field of the right struct to recover the cause.</p>
+<h2 data-number="4.10" id="idiom:predicate"><span class="header-section-number">4.10</span> Idiom I10: character predicate macros</h2>
+<pre style="cstyle"><code>#define IS_BLANK(string)  ((string).pointer[0] == &#39; &#39;  \
+                        || (string).pointer[0] == &#39;\t&#39;)
+#define IS_BREAK(string)  ((string).pointer[0] == &#39;\r&#39; \
+                        || (string).pointer[0] == &#39;\n&#39; \
+                        /* ... or various Unicode line breaks */)
+#define CHECK(string, octet)   ((string).pointer[0] == (octet))
+#define CHECK_AT(string, octet, offset) \
+                               ((string).pointer[offset] == (octet))
+#define FORWARD(string)        ((string).pointer++)</code></pre>
+<p>Each predicate indexes into a <code>yaml_string_t</code> at a relative offset and compares to a constant. The implicit precondition is that <code>pointer + offset &lt; end</code>; the scanner’s invariants make this true at every call site, but the precondition is unwritten.</p>
+<h2 data-number="4.11" id="idiom:setjmp"><span class="header-section-number">4.11</span> Idiom I11: setjmp/longjmp non-local control flow</h2>
+<p><code>libyaml</code> does not use <code>setjmp/longjmp</code>, but the closely related <code>libpng</code> does. We mention it because it is the limit case of UB-class harm: <code>longjmp</code> unwinds without running any cleanup, leaving <code>malloc</code>-ed memory leaked and locks held. <span class="nodecor"><span class="smallcaps">Rust</span></span> has no analogue; <code>panic::catch_unwind</code> is the closest, and it requires careful boundary analysis.</p>
+<h1 data-number="5" id="sec:contracts"><span class="header-section-number">5</span> Translation Contracts</h1>
+<p>For each idiom in <a href="#sec:libyaml-idioms" data-reference-type="ref+Label" data-reference="sec:libyaml-idioms">4</a> we now state a <em>translation contract</em>: an inference rule whose conclusion is a typed <span class="nodecor"><span class="smallcaps">Rust</span></span> construct, whose premises are the side conditions that make the translation a refinement (<a href="#def:refines" data-reference-type="ref+Label" data-reference="def:refines">7</a>). Discharging the side conditions is the work of the analysis pipeline.</p>
+<h2 data-number="5.1" id="contract-c1-for-i1-yaml_string_t"><span class="header-section-number">5.1</span> Contract C1 for I1 (yaml_string_t)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The analysis must show that no live pointer aliases <code>x.start</code> except those that can be proven to be lexical sub-expressions of accesses through <code>x.pointer</code>. Failing this, the structure must be classified as <span class="math inline">\(\mathsf{Shar}\)</span> and translated to <code>Rc&lt;RefCell&lt;Vec&lt;u8&gt;&gt;&gt;</code>.</p>
+<h2 data-number="5.2" id="contract-c2-for-i2-container-macros"><span class="header-section-number">5.2</span> Contract C2 for I2 (container macros)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The container is owned: malloc and free occur in the same scope (or an unambiguous owner-droppee pair).</p>
+<h2 data-number="5.3" id="contract-c3-for-i3-integer-as-bool"><span class="header-section-number">5.3</span> Contract C3 for I3 (integer-as-bool)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> Every documented call site checks the return; no callee uses a return value other than 0 or 1.</p>
+<h2 data-number="5.4" id="contract-c4-for-i4-output-parameter"><span class="header-section-number">5.4</span> Contract C4 for I4 (output parameter)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The output parameter is written on the success path and unmodified on the failure path. The static analyser checks this via use-def chains.</p>
+<h2 data-number="5.5" id="contract-c5-for-i5-tagged-union"><span class="header-section-number">5.5</span> Contract C5 for I5 (tagged union)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> For every read of <code>u.</code><span class="math inline">\(\mathit{data}_i\)</span> the analysis must witness a dominator condition <code>t == V</code><span class="math inline">\(_i\)</span>. This is straightforward control-flow analysis when the tag is checked in a <code>switch</code>; difficult when checked in disjoint <code>if</code> chains.</p>
+<h2 data-number="5.6" id="contract-c6-for-i6-allocator-hooks"><span class="header-section-number">5.6</span> Contract C6 for I6 (allocator hooks)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> If the customised allocator is purely an arena (always-grow, free-all-at-once), the translation may use <code>bumpalo::Bump</code>. If the allocator carries domain semantics (counters, telemetry), the translation must expose a <code>trait Allocator</code> parameter.</p>
+<h2 data-number="5.7" id="contract-c7-for-i7-aliasing"><span class="header-section-number">5.7</span> Contract C7 for I7 (aliasing)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The scanner cannot mutate <code>parser.buffer</code> while a slice borrowed from it is live. In practice, this requires restructuring <code>yaml_parser_update_buffer</code> so it is called only between token productions, and adding the lifetime parameter to the scanner’s return type.</p>
+<h2 data-number="5.8" id="contract-c8-for-i8-nullable"><span class="header-section-number">5.8</span> Contract C8 for I8 (nullable)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The aliasing analysis confirms that NULL is the only sentinel; no other distinguished pointer value carries optionality.</p>
+<h2 data-number="5.9" id="contract-c9-for-i9-ambient-error"><span class="header-section-number">5.9</span> Contract C9 for I9 (ambient error)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The error fields are written together at the failure site (i.e., they are not independently writable). The <span class="nodecor"><span class="smallcaps">Rust</span></span> <code>Error</code> type fuses them into a single value.</p>
+<h2 data-number="5.10" id="contract-c10-for-i10-predicates"><span class="header-section-number">5.10</span> Contract C10 for I10 (predicates)</h2>
+<div class="mathpar">
+
+</div>
+<p><strong>Proof obligation.</strong> The bounds precondition is verified by data-flow analysis; or the translation falls back to a checked variant that returns <code>false</code> on out-of-bounds.</p>
+<h2 data-number="5.11" id="contract-c11-for-i11-longjmp"><span class="header-section-number">5.11</span> Contract C11 for I11 (longjmp)</h2>
+<p>We do not give a contract: <code>longjmp</code> requires per-codebase analysis of the dynamic call graph and the cleanup actions skipped. The default refinement is to refactor the <span class="nodecor"><span class="smallcaps">C</span></span> source first to remove the <code>longjmp</code>, then translate.</p>
+<h2 data-number="5.12" id="composability"><span class="header-section-number">5.12</span> Composability</h2>
+<div id="thm:compose" class="theorem">
+<p><strong>Theorem 8</strong> (Idiom composability).  <em>If a function <span class="math inline">\(f\)</span> decomposes into idioms <span class="math inline">\(I_{i_1}, \ldots, I_{i_k}\)</span> and each idiom satisfies its proof obligation, then <span class="math inline">\(\mathcal{T}(f)\)</span> is a refinement (<a href="#def:refines" data-reference-type="ref+Label" data-reference="def:refines">7</a>) of <span class="math inline">\(f\)</span>.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof sketch.</em> Each contract <span class="math inline">\(C_i\)</span> is a refinement at the type <span class="math inline">\(T_i\)</span> of the <span class="nodecor"><span class="smallcaps">Rust</span></span> construct it produces. Refinement is closed under composition: if <span class="math inline">\(g \sqsubseteq_{T} g&#39;\)</span> and <span class="math inline">\(h \sqsubseteq_{S} h&#39;\)</span>, and the types compose, then <span class="math inline">\(g \circ h \sqsubseteq_{S} g&#39; \circ h&#39;\)</span>. Function bodies are constructed from sub-expressions whose types compose by ordinary subject-reduction. The hypothesis that each proof obligation discharges supplies the side conditions for each <span class="math inline">\(C_i\)</span>. 0◻ ◻</p>
+</div>
+<p><a href="#thm:compose" data-reference-type="ref+Label" data-reference="thm:compose">8</a> is the formal foundation of the agent pipeline: idiom recognition by an analysis agent, contract application by a translation agent, and proof obligation discharge by the verification agent compose into a refinement-correct translation.</p>
+<h2 data-number="5.13" id="sec:obligations"><span class="header-section-number">5.13</span> The proof-obligation problem: undecidability and human-in-the-loop</h2>
+<p><a href="#thm:compose" data-reference-type="ref+Label" data-reference="thm:compose">8</a> is conditional. Each contract carries a side condition — “no live alias to <code>x.start</code>” (C1), “every read of <code>u.</code><span class="math inline">\(\mathit{data}_i\)</span> is dominated by <code>t == V</code><span class="math inline">\(_i\)</span>” (C5), “the function follows the integer-as-bool convention” (C3) — and the theorem is silent on <em>how</em> those side conditions are to be discharged. We must be explicit: in general they cannot be discharged automatically.</p>
+<p><strong>Undecidability.</strong> Pointer aliasing is a classical undecidable problem: precisely deciding whether two pointer expressions in an arbitrary <span class="nodecor"><span class="smallcaps">C</span></span> program may alias is equivalent to the halting problem <span class="citation" data-cites="landi1992undecidable"></span>. Tagged-union dominator conditions reduce to control-flow reachability under arbitrary integer constraints, also undecidable in the general case. Any practical analysis is therefore an over-approximation: it returns <span class="smallcaps">may-alias</span> (or <span class="smallcaps">cannot-prove-dominator</span>) when it cannot establish the precise answer.</p>
+<p><strong>Three regimes.</strong> A real translation pipeline must accept that obligations fall into one of three regimes for each function:</p>
+<ol>
+<li><p><strong>Discharged.</strong> A sound static analysis (Andersen-style points-to with the SVF tool, dominator analysis with LLVM’s <code>DominatorTree</code>) confirms the obligation. The translation proceeds without human intervention.</p></li>
+<li><p><strong>Refuted.</strong> The analysis exhibits a counter-example (an aliasing witness, a missing dominator). The translation must classify the function as <span class="math inline">\(\mathsf{Raw}\)</span> (fall back to a less-restrictive ownership class such as <code>Rc&lt;RefCell&lt;T&gt;&gt;</code> or, in the worst case, an <code>unsafe</code> block with a justification comment).</p></li>
+<li><p><strong>Inconclusive.</strong> The analysis times out, or returns “may” on a question requiring “no.” The function is escalated to human review.</p></li>
+</ol>
+<p><strong>Empirical expectation.</strong> Crown <span class="citation" data-cites="zhang2023crown"></span> reports successful ownership inference on roughly 60–80% of pointer parameters across a benchmark of real C codebases of the size of <code>libyaml</code>; Laertes <span class="citation" data-cites="emre2023laertes"></span> reports a smaller fraction of fully-lifted functions. We expect, by analogy, that approximately 60–75% of <code>libyaml</code>’s 175 functions will fall in regime 1, 10–20% in regime 2 (forcing a less-precise translation), and 10–25% in regime 3 (requiring human review). The Ferrous Bridge “six-gate verification” (<code>rustc</code> compile, Miri pass, fuzz parity, Clippy clean, complexity ratio, optionally Kani for high-assurance) is the safety net for regime 2 and the success criterion for regime 3.</p>
+<p><strong>Bottom line.</strong> The composition theorem is a soundness statement <em>conditioned on discharge</em>; in practice, discharge is partial, and the pipeline therefore must include explicit human-review and fallback mechanisms. The development plan in <a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a> accordingly produces a <em>confidence-annotated</em> OSG, not a guarantee.</p>
+<h1 data-number="6" id="sec:diagram"><span class="header-section-number">6</span> The Composition Diagram</h1>
+<p>The translation pipeline is summarised by the commutative diagram in <a href="#fig:diagram" data-reference-type="ref+Label" data-reference="fig:diagram">1</a>. The horizontal arrows are the source-language semantics (<span class="nodecor"><span class="smallcaps">C</span></span> small-step) and the target-language semantics (<span class="nodecor"><span class="smallcaps">Rust</span></span> small-step). The vertical arrows are the translation <span class="math inline">\(\mathcal{T}\)</span> and the inverse projection <span class="math inline">\(\pi\)</span>.</p>
+<figure id="fig:diagram" data-latex-placement="h">
+
+<figcaption>The translation <span class="math inline">\(\mathcal{T}\)</span> commutes with reduction modulo refinement. Concretely: if the <span class="nodecor"><span class="smallcaps">C</span></span> source steps from <span class="math inline">\(\langle e_C,\ \sigma_C\rangle\)</span> to <span class="math inline">\(\langle e&#39;_C,\ \sigma&#39;_C\rangle\)</span> and the resulting state is well-defined, the <span class="nodecor"><span class="smallcaps">Rust</span></span> translation steps to a state in the inverse image of <span class="math inline">\(\mathcal{T}\)</span>. UB-tripping reductions are excluded from the diagram (the source is partial on UB inputs).</figcaption>
+</figure>
+<h1 data-number="7" id="sec:example"><span class="header-section-number">7</span> Worked Example: yaml_parser_parse</h1>
+<p>We work through one full example. The function <code>yaml_parser_parse</code> appears in <code>parser.c</code>; an excerpt:</p>
+<pre style="cstyle"><code>int yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event) {
+    assert(parser);
+    assert(event);
+    memset(event, 0, sizeof(yaml_event_t));
+    if (parser-&gt;stream_end_produced ||
+        parser-&gt;error ||
+        parser-&gt;state == YAML_PARSE_END_STATE) {
+        return 1;
+    }
+    return yaml_parser_state_machine(parser, event);
+}</code></pre>
+<p><strong>Idiom decomposition.</strong> The function exhibits I3 (integer-as-bool return), I4 (output parameter <code>event</code>), I9 (ambient error in <code>parser-&gt;error</code>), and I6 (the parser was allocated with the custom allocator hooks).</p>
+<p><strong>Translation.</strong> Applying contracts C3, C4, C9, and C6:</p>
+<pre class="Rust" style="ruststyle" data-language="Rust"><code>impl Parser {
+    pub fn parse(&amp;mut self) -&gt; Result&lt;Event, Error&gt; {
+        if self.stream_end_produced
+           || self.last_error.is_some()
+           || self.state == ParserState::End {
+            return Ok(Event::StreamEnd);
+        }
+        self.state_machine()
+    }
+}</code></pre>
+<p><strong>Proof obligations discharged.</strong> (i) <code>event</code> is written iff return 1: yes, the C body memsets and then <code>state_machine</code> writes on success. (ii) Error is stashed iff return 0: yes, by inductive examination of <code>state_machine</code>. (iii) Allocator is the system allocator (no custom hooks installed by libyaml’s tests): yes. (iv) The <code>event</code> value carries no internal references, so there is no lifetime parameter on the return type.</p>
+<p><strong>Refinement check.</strong> For every input on which the C version is well-defined, the <span class="nodecor"><span class="smallcaps">Rust</span></span> version produces the same event, modulo the field-by-field correspondence between |yaml_event_t| and <code>Event</code>. When the C version is UB — e.g. a NULL parser pointer is passed — the <span class="nodecor"><span class="smallcaps">Rust</span></span> version cannot be invoked at all, since <code>&amp;mut Parser</code> cannot be NULL by construction. This is the asymmetric refinement of <a href="#def:refines" data-reference-type="ref+Label" data-reference="def:refines">7</a>.</p>
+<h1 data-number="8" id="sec:related"><span class="header-section-number">8</span> Related Work</h1>
+<p><strong>Executable C semantics.</strong> The KCC project of Ellison and Roşu <span class="citation" data-cites="ellison2012"></span> gives an executable, K-framework semantics of ISO C99, used to generate compilers, debuggers, and dynamic UB checkers. Krebbers’ CH<span class="math inline">\(_2\)</span>O <span class="citation" data-cites="krebbers2015"></span> formalises a substantial fragment of C99 in Coq with provenance and effective types. Memarian et al.’s Cerberus <span class="citation" data-cites="memarian2019"></span> clarifies the behaviour of pointer arithmetic on integer-pointer casts. Our small-step rules are a translation-relevant fragment of these efforts.</p>
+<p><strong>Verified compilation.</strong> CompCert <span class="citation" data-cites="leroy2009"></span> is a formally verified <span class="nodecor"><span class="smallcaps">C</span></span>-to-assembly compiler with a Coq proof of source-target refinement. Its semantics is the gold standard for “what <span class="nodecor"><span class="smallcaps">C</span></span> <em>means</em>.” We are pursuing a different problem — translation to a different source language, not verified compilation to assembly — but the refinement notion in <a href="#def:refines" data-reference-type="ref+Label" data-reference="def:refines">7</a> is the same.</p>
+<p><strong>Mechanical <span class="nodecor"><span class="smallcaps">C</span></span>-to-<span class="nodecor"><span class="smallcaps">Rust</span></span> translation.</strong> The mainstream tool is <code>c2rust</code> <span class="citation" data-cites="c2rust2025"></span> from Galois and Immunant. It produces mechanically faithful <code>unsafe</code> <span class="nodecor"><span class="smallcaps">Rust</span></span>, with <code>unsafe-libyaml</code> as the canonical exemplar. A successor analysis pass to lift the output to safer <span class="nodecor"><span class="smallcaps">Rust</span></span> is in development as of <code>c2rust</code> v0.21.</p>
+<p><strong>Ownership analysis.</strong> Crown <span class="citation" data-cites="zhang2023crown"></span> performs scalable static ownership inference on real-world <span class="nodecor"><span class="smallcaps">C</span></span> codebases. Laertes <span class="citation" data-cites="emre2023laertes"></span> reduces unsafe code presence via a search procedure with the <span class="nodecor"><span class="smallcaps">Rust</span></span> compiler as oracle. Our translation contracts (<a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a>) are the rule-set against which a Crown- or Laertes-style analyser would check for matches.</p>
+<p><strong>LLM-driven translation.</strong> SACTOR <span class="citation" data-cites="sactor2025"></span> uses a two-step LLM translation (preserve semantics, then idiomatise). RustMap <span class="citation" data-cites="rustmap2025"></span>, Syzygy, Rustine <span class="citation" data-cites="rustine2025"></span>, EvoC2Rust, and ORBIT <span class="citation" data-cites="orbit2026"></span> are recent agentic pipelines. The Ferrous Bridge approach is hybrid: static analysis produces the CAB (<a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a>), the translation engine routes hard cases to Claude and easy cases to a fine-tuned model, and the verification gate is six-layer (<code>rustc</code>, Miri, fuzz, Clippy, complexity, Kani in high-assurance mode).</p>
+<p><strong>Verification.</strong> Miri <span class="citation" data-cites="jung2026miri"></span> interprets <span class="nodecor"><span class="smallcaps">Rust</span></span> MIR under the stacked-borrows aliasing model. Kani <span class="citation" data-cites="kani2024"></span> performs symbolic model checking. RustBelt <span class="citation" data-cites="jung2018rustbelt"></span> establishes the soundness of <span class="nodecor"><span class="smallcaps">Rust</span></span>’s ownership type system on a core calculus.</p>
+<h1 data-number="9" id="sec:discussion"><span class="header-section-number">9</span> Discussion</h1>
+<h2 data-number="9.1" id="what-this-paper-is-not"><span class="header-section-number">9.1</span> What this paper is not</h2>
+<p>We have not given a complete formal semantics of ISO C18. We have not given a verified translation algorithm. We have not provided a tool. The paper is a <em>reference</em> for the analysis-phase agents (<a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a>) and for the human reviewers who will examine their outputs. The accompanying <code>rust</code> paper <span class="citation" data-cites="rustpaper"></span> formalises the target language and the <code>c-rust-transpiling</code> paper <span class="citation" data-cites="transpilingpaper"></span> formalises the translation engine.</p>
+<h2 data-number="9.2" id="limits-of-the-contract-approach"><span class="header-section-number">9.2</span> Limits of the contract approach</h2>
+<p>Translation contracts are sound only when their proof obligations are discharged. We have already noted (<a href="#sec:obligations" data-reference-type="ref+Label" data-reference="sec:obligations">5.13</a>) that discharge is fundamentally undecidable in the general case and that practical pipelines therefore rely on conservative analysis plus human review. Beyond that overarching limit, four specific sources of incompleteness deserve mention. First, alias analysis on real <span class="nodecor"><span class="smallcaps">C</span></span> is conservative: many pointers will be classified as <span class="math inline">\(\mathsf{Raw}\)</span> and require human review. Second, the integer-as-bool contract C3 assumes the function follows the convention; there are exceptions in <code>libyaml</code> (notably <code>yaml_parser_get_token</code> returns the token directly), which require special-casing. Third, the tagged-union contract C5 requires a dominator condition that is sometimes implicit in <code>switch</code> fall-through. Fourth, and most starkly, the framework as presented <em>does not handle non-local control flow</em>: <code>setjmp</code>/<code>longjmp</code> (and to a lesser extent <code>goto</code> into nested scopes) cannot be translated by any of the contracts in this paper. The fallback recommendation in <a href="#sec:libyaml-idioms" data-reference-type="ref+Label" data-reference="sec:libyaml-idioms">4</a> (idiom I11) — refactor the <span class="nodecor"><span class="smallcaps">C</span></span> source to remove <code>longjmp</code> before translation — is genuinely a limitation, not a feature, and any pipeline targeting <code>libpng</code> or comparable libraries will need a dedicated treatment of this case.</p>
+<h2 data-number="9.3" id="why-not-just-translate-to-unsafe-rust-and-call-it-done"><span class="header-section-number">9.3</span> Why not just translate to unsafe Rust and call it done?</h2>
+<p>A translation to <code>unsafe</code> <span class="nodecor"><span class="smallcaps">Rust</span></span> preserves the C invariants at runtime, where they will be violated, and re-presents the <span class="nodecor"><span class="smallcaps">Rust</span></span> compiler as a notational change rather than a semantic one. The mechanical <code>c2rust</code> pipeline produces exactly such output, and the result is the <code>unsafe-libyaml</code> crate that motivates this paper: same memory-safety risk profile as the <span class="nodecor"><span class="smallcaps">C</span></span> original, simply expressed in different syntax. The value of a translation is in the implicit invariants it promotes to compile-time enforcement; <code>unsafe</code> <span class="nodecor"><span class="smallcaps">Rust</span></span> promotes none. We adopt this perspective from Long <span class="citation" data-cites="long2026c2rust"></span> as the orienting principle for what counts as a successful translation.</p>
+<h2 data-number="9.4" id="future-directions"><span class="header-section-number">9.4</span> Future directions</h2>
+<p>Three open directions follow from this paper.</p>
+<ol>
+<li><p><strong>A complete CAB schema.</strong> <a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a> sketches the schema; a definitive Protocol Buffers definition is needed, with versioning and forward-compatibility guarantees.</p></li>
+<li><p><strong>Automated discharge of proof obligations.</strong> Several contracts have proof obligations that current analysis tools (Crown, SVF) can discharge in principle but not by default. Wrapping these into the analysis pipeline is engineering, not research.</p></li>
+<li><p><strong>Extending the idiom set to <code>libexpat</code>.</strong> <code>libexpat</code>’s SAX-callback API and DTD recursion introduce idioms (I12: callback context, I13: recursive entity expansion) that <code>libyaml</code> does not exhibit. The next paper will extend the catalogue.</p></li>
+</ol>
+<h1 data-number="10" id="sec:conclusion"><span class="header-section-number">10</span> Conclusion</h1>
+<p>We have presented a translation-relevant operational semantics of <span class="nodecor"><span class="smallcaps">C</span></span>, a seven-class taxonomy of undefined behaviour aligned with the <span class="nodecor"><span class="smallcaps">Rust</span></span> features that statically forbid each class, an exhaustive catalogue of the eleven <code>libyaml</code> idioms, and a translation contract for each. The composition theorem (<a href="#thm:compose" data-reference-type="ref+Label" data-reference="thm:compose">8</a>) certifies that idiom-by-idiom translation lifts to function-level refinement. The development plan in <a href="#app:devplan" data-reference-type="ref+Label" data-reference="app:devplan">11</a> grounds this theory in twenty-nine concrete tasks for the analysis-phase prototype agents. The result is a reference work that an analysis agent or a human reviewer can use to convert <code>libyaml</code>’s nine thousand lines of <span class="nodecor"><span class="smallcaps">C</span></span> into a published <code>safe-libyaml</code> crate with provenance evidence at every step.</p>
+<p>The companion <code>rust</code> paper formalises the target language; the <code>c-rust-transpiling</code> paper formalises the translation engine; the synthesis paper formalises the orchestration pipeline that composes the three. Together, they specify the Ferrous Bridge programme.</p>
+<h1 data-number="11" id="app:devplan"><span class="header-section-number">11</span> Development Plan for Prototype Agents (Analysis Phase)</h1>
+<p>This appendix specifies the analysis-phase prototype agents that produce the <em>C-Analysis Bundle</em> (CAB), the typed input to the Ownership Semantic Graph (OSG) stage downstream. The work is organised into five sub-phases (A1.1 through A1.5) and twenty-nine checkbox tasks. Each task has the structure:</p>
+<blockquote>
+<p>Agent: <em>name</em> <span class="math inline">\(\cdot\)</span> Task: <em>verb-phrase</em><br />
+    Inputs: <em>files / artifacts</em><br />
+    Output: <em>artifact path under fb-analysis/</em><br />
+    Success: <em>verifiable criterion</em><br />
+    Est: <em>normalized work units</em></p>
+</blockquote>
+<p>A <em>normalized work unit</em> is the abstract effort of one well-scoped engineer-day under the assumption that tooling already exists, dependencies are pinned, and the task does not bottleneck on external services. Units do not equate to wall-clock time in production — the actual time depends on agent assistance, parallelism across worktrees, debugging cycles, and external compute (for example, SVF on <code>libyaml</code>’s bitcode). Units are useful for relative scoping and for sequencing a critical path; they are explicitly not a delivery promise.</p>
+<h2 data-number="11.1" id="sub-phase-a1.1-source-acquisition-and-pinning"><span class="header-section-number">11.1</span> Sub-phase A1.1: Source acquisition and pinning</h2>
+<div class="description">
+<p><span>Agent: A1-fork <span class="math inline">\(\cdot\)</span> Task: Fork libyaml at a pinned commit.</span><br />
+Inputs: github.com/yaml/libyaml, commit hash 840b65c40675e2d06bf40405ad3f12dec7f35923 (v0.2.5).<br />
+Output: fb-analysis/sources/libyaml/ (git submodule).<br />
+Success: <code>git rev-parse HEAD</code> matches the pinned hash; <code>cmake</code> build succeeds.<br />
+Est: 1 unit.</p>
+<p><span>Agent: A1-fork <span class="math inline">\(\cdot\)</span> Task: Fork unsafe-libyaml at a pinned commit (Rung 1).</span><br />
+Inputs: github.com/dtolnay/unsafe-libyaml, latest tagged release.<br />
+Output: fb-analysis/sources/unsafe-libyaml/.<br />
+Success: <code>cargo check</code> succeeds; <code>grep -rn unsafe src/</code> count recorded as the baseline that <code>safe-libyaml</code> must reduce to zero.<br />
+Est: 1 unit.</p>
+<p><span>Agent: A1-fork <span class="math inline">\(\cdot\)</span> Task: Fork libyaml-safer at a pinned commit (Rung 2).</span><br />
+Inputs: github.com/simonask/libyaml-safer.<br />
+Output: fb-analysis/sources/libyaml-safer/.<br />
+Success: <code>cargo check</code> and <code>cargo test</code> succeed; commit hash recorded.<br />
+Est: 1 unit.</p>
+<p><span>Agent: A1-fork <span class="math inline">\(\cdot\)</span> Task: Fork yaml-test-suite at a pinned commit.</span><br />
+Inputs: github.com/yaml/yaml-test-suite.<br />
+Output: fb-analysis/sources/yaml-test-suite/.<br />
+Success: 400+ test cases enumerated; expected-events files validated as well-formed.<br />
+Est: 1 unit.</p>
+</div>
+<h2 data-number="11.2" id="sub-phase-a1.2-static-analysis-with-clang"><span class="header-section-number">11.2</span> Sub-phase A1.2: Static analysis with Clang</h2>
+<div class="description">
+<p><span>Agent: A1-clang-tidy <span class="math inline">\(\cdot\)</span> Task: Run clang-tidy with bug-prone, cert, performance, security, portability check sets.</span><br />
+Inputs: fb-analysis/sources/libyaml/src/*.c.<br />
+Output: fb-analysis/clang-tidy.json (JSON-formatted issues).<br />
+Success: report exists; total issue count recorded; classified by file and severity.<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-clang-check <span class="math inline">\(\cdot\)</span> Task: Run clang-check with all default analyses.</span><br />
+Inputs: fb-analysis/sources/libyaml/src/*.c with compile_commands.json.<br />
+Output: fb-analysis/clang-check.txt.<br />
+Success: report exists; checker categories enumerated.<br />
+Est: 1 unit.</p>
+<p><span>Agent: A1-ast-dump <span class="math inline">\(\cdot\)</span> Task: Generate per-translation-unit JSON AST dumps via clang -Xclang -ast-dump=json.</span><br />
+Inputs: fb-analysis/sources/libyaml/src/*.c.<br />
+Output: fb-analysis/ast/&lt;file&gt;.ast.json for every .c file.<br />
+Success: a non-trivial AST is generated for each translation unit; each file parses with <code>jq</code>; the total node count is recorded as a sanity-check baseline for downstream tooling.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-llvm-ir <span class="math inline">\(\cdot\)</span> Task: Emit LLVM IR via clang -emit-llvm -S -O0.</span><br />
+Inputs: fb-analysis/sources/libyaml/src/*.c.<br />
+Output: fb-analysis/ir/&lt;file&gt;.ll for every .c file.<br />
+Success: ten .ll files produced; each is well-formed (<code>opt -verify</code> succeeds).<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-cfg <span class="math inline">\(\cdot\)</span> Task: Extract per-function control-flow graphs via opt -dot-cfg.</span><br />
+Inputs: fb-analysis/ir/*.ll.<br />
+Output: fb-analysis/cfg/&lt;function&gt;.dot.<br />
+Success: <span class="math inline">\(\geq 175\)</span> .dot files (one per function); each is a valid DOT graph.<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-callgraph <span class="math inline">\(\cdot\)</span> Task: Extract the call graph via egypt or opt -dot-callgraph.</span><br />
+Inputs: fb-analysis/ir/*.ll.<br />
+Output: fb-analysis/callgraph/global.dot.<br />
+Success: nodes correspond to all 175 libyaml functions; reachability set from <code>yaml_parser_parse</code> matches the manual function map.<br />
+Est: 2 units.</p>
+</div>
+<h2 data-number="11.3" id="sub-phase-a1.3-pointer-and-use-def-analysis"><span class="header-section-number">11.3</span> Sub-phase A1.3: Pointer and use-def analysis</h2>
+<div class="description">
+<p><span>Agent: A1-svf <span class="math inline">\(\cdot\)</span> Task: Run SVF (Static Value-Flow) Andersen-style points-to.</span><br />
+Inputs: linked LLVM bitcode fb-analysis/ir/libyaml.bc.<br />
+Output: fb-analysis/points-to/andersen.json.<br />
+Success: every pointer has a points-to set; sets are correctly typed.<br />
+Est: 4 units.</p>
+<p><span>Agent: A1-svf <span class="math inline">\(\cdot\)</span> Task: Run SVF flow-sensitive analysis on hot functions.</span><br />
+Inputs: same bitcode plus a function whitelist (<code>yaml_parser_scan</code>, <code>yaml_emitter_emit</code>, <code>yaml_parser_parse</code>).<br />
+Output: fb-analysis/points-to/flow-sensitive.json.<br />
+Success: points-to sets for whitelisted functions strictly smaller than Andersen sets.<br />
+Est: 4 units.</p>
+<p><span>Agent: A1-usedef <span class="math inline">\(\cdot\)</span> Task: Extract def-use chains for every yaml_* function.</span><br />
+Inputs: fb-analysis/ir/*.ll.<br />
+Output: fb-analysis/use-def/&lt;function&gt;.json.<br />
+Success: every IR <code>store</code> instruction has at least one use-def edge.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-ownership-classifier <span class="math inline">\(\cdot\)</span> Task: Apply the seven heuristic rules (Owning / BorrowShared / BorrowMut / SharedOwnership / RawUnsafe) to every pointer parameter.</span><br />
+Inputs: fb-analysis/points-to/*.json, fb-analysis/use-def/*.json.<br />
+Output: fb-analysis/ownership/classification.json.<br />
+Success: every pointer parameter labelled with a class and a confidence in <span class="math inline">\([0, 1]\)</span>; the mean confidence is reported, and pointers below the routing threshold (set empirically per regime 3 of <a href="#sec:obligations" data-reference-type="ref+Label" data-reference="sec:obligations">5.13</a>; an initial value of 0.5 is suggested but may be tuned) are flagged for human review.<br />
+Est: 5 units.</p>
+<p><span>Agent: A1-idiom-detector <span class="math inline">\(\cdot\)</span> Task: Detect occurrences of idioms I1–I10 across the source.</span><br />
+Inputs: fb-analysis/ast/*.json, ownership classifications.<br />
+Output: fb-analysis/idioms/occurrences.json.<br />
+Success: each of I1–I10 has at least three concrete occurrences with file/line locations.<br />
+Est: 4 units.</p>
+</div>
+<h2 data-number="11.4" id="sub-phase-a1.4-dynamic-analysis"><span class="header-section-number">11.4</span> Sub-phase A1.4: Dynamic analysis</h2>
+<div class="description">
+<p><span>Agent: A1-callgrind <span class="math inline">\(\cdot\)</span> Task: Build instrumented libyaml; run all 400+ yaml-test-suite cases under valgrind –tool=callgrind.</span><br />
+Inputs: built libyaml binary, yaml-test-suite.<br />
+Output: fb-analysis/traces/callgrind/&lt;test-id&gt;.out.<br />
+Success: 400+ trace files produced; total instruction count of expected order.<br />
+Est: 4 units.</p>
+<p><span>Agent: A1-callgrind <span class="math inline">\(\cdot\)</span> Task: Aggregate callgrind traces into a dynamic-call-edge frequency map.</span><br />
+Inputs: fb-analysis/traces/callgrind/*.out.<br />
+Output: fb-analysis/traces/dynamic-callgraph.json.<br />
+Success: every dynamic call edge has a frequency count; hottest edges are inside <code>yaml_parser_scan</code>.<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-asan <span class="math inline">\(\cdot\)</span> Task: Build libyaml with AddressSanitizer and run the suite.</span><br />
+Inputs: libyaml sources, yaml-test-suite.<br />
+Output: fb-analysis/asan/log.txt.<br />
+Success: zero ASan reports on the public suite; any reports recorded as bug candidates.<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-msan <span class="math inline">\(\cdot\)</span> Task: Build with MemorySanitizer; run the suite (catches uninitialised reads).</span><br />
+Inputs: libyaml sources, yaml-test-suite.<br />
+Output: fb-analysis/msan/log.txt.<br />
+Success: zero MSan reports; any reports flagged for hand-review.<br />
+Est: 2 units.</p>
+<p><span>Agent: A1-ubsan <span class="math inline">\(\cdot\)</span> Task: Build with UndefinedBehaviorSanitizer; run the suite.</span><br />
+Inputs: libyaml sources, yaml-test-suite.<br />
+Output: fb-analysis/ubsan/log.txt.<br />
+Success: zero UBSan reports; any signed-overflow or alignment hits recorded.<br />
+Est: 2 units.</p>
+</div>
+<h2 data-number="11.5" id="sub-phase-a1.5-cab-schema-and-packaging"><span class="header-section-number">11.5</span> Sub-phase A1.5: CAB schema and packaging</h2>
+<div class="description">
+<p><span>Agent: A1-cab-schema <span class="math inline">\(\cdot\)</span> Task: Define the protobuf schema for the CAB.</span><br />
+Inputs: requirements from <a href="#sec:contracts" data-reference-type="ref+Label" data-reference="sec:contracts">5</a> (every contract’s proof obligation must be expressible).<br />
+Output: fb-analysis/cab.proto.<br />
+Success: schema compiles with <code>protoc</code>; round-trip serialisation test passes for a synthetic CAB.<br />
+Est: 4 units.</p>
+<p><span>Agent: A1-cab-schema <span class="math inline">\(\cdot\)</span> Task: Write the schema validator (prost on the Rust side, protobuf on the Python side).</span><br />
+Inputs: fb-analysis/cab.proto.<br />
+Output: fb-analysis/cab-validator/ (Rust crate).<br />
+Success: <code>cargo test</code> green on synthetic and real CAB inputs.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-cab-builder <span class="math inline">\(\cdot\)</span> Task: Build the CAB consuming all artifacts from A1.2–A1.4; emit a single CAB.</span><br />
+Inputs: AST JSONs, IR, points-to, use-def, ownership, idioms, traces.<br />
+Output: fb-analysis/libyaml.cab.pb.<br />
+Success: CAB validates; size <span class="math inline">\(\leq 200\)</span> MB; deserialises back to all source artifacts.<br />
+Est: 5 units.</p>
+<p><span>Agent: A1-function-map <span class="math inline">\(\cdot\)</span> Task: Emit function_map.md with one row per function (C signature, ownership classes, idioms, predicted Rust signature).</span><br />
+Inputs: CAB.<br />
+Output: fb-analysis/function_map.md.<br />
+Success: 175+ rows; every predicted Rust signature compiles in a stub crate.<br />
+Est: 4 units.</p>
+<p><span>Agent: A1-type-map <span class="math inline">\(\cdot\)</span> Task: Emit type_map.md for every C type (field-by-field Rust counterpart, pointer ownership, lifetimes).</span><br />
+Inputs: CAB.<br />
+Output: fb-analysis/type_map.md.<br />
+Success: every C struct or union in yaml.h and yaml_private.h mapped.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-macro-map <span class="math inline">\(\cdot\)</span> Task: Emit macro_map.md for every macro (expansion, Rust equivalent, replaceability).</span><br />
+Inputs: CAB plus yaml_private.h.<br />
+Output: fb-analysis/macro_map.md.<br />
+Success: every STRING_*, STACK_*, QUEUE_*, IS_*, CHECK*, FORWARD* macro mapped.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-pattern-catalog <span class="math inline">\(\cdot\)</span> Task: Emit pattern_catalog.md keyed on idioms I1–I10 with concrete locations.</span><br />
+Inputs: CAB idioms section.<br />
+Output: fb-analysis/pattern_catalog.md.<br />
+Success: each idiom has <span class="math inline">\(\geq 3\)</span> occurrences with file:line and a translation pointer.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-cve-survey <span class="math inline">\(\cdot\)</span> Task: Survey NVD for libyaml CVEs since 2013; align each to UB classes UB1–UB7.</span><br />
+Inputs: NVD JSON feed, CVE history.<br />
+Output: fb-analysis/cve-survey.md.<br />
+Success: every libyaml CVE classified; the table is the validation set for the safety claims of safe-libyaml.<br />
+Est: 3 units.</p>
+<p><span>Agent: A1-translation-plan <span class="math inline">\(\cdot\)</span> Task: Emit the wave-ordered translation plan from the CAB.</span><br />
+Inputs: CAB callgraph and dependencies.<br />
+Output: fb-analysis/translation_plan.md.<br />
+Success: 7 waves listed with file assignments matching the agent-plan; topological sort respects callgraph edges.<br />
+Est: 2 units.</p>
+</div>
+<h2 data-number="11.6" id="total-estimate-and-dependency-dag"><span class="header-section-number">11.6</span> Total estimate and dependency DAG</h2>
+<p>The twenty-nine tasks total approximately seventy-seven normalized work units. We re-emphasise that this is a relative scoping number, not a delivery estimate: the actual elapsed time is determined by parallelism across worktrees, by agent assistance, and by the proportion of obligations that fall in regimes 2 or 3 (<a href="#sec:obligations" data-reference-type="ref+Label" data-reference="sec:obligations">5.13</a>) and require human review. The twenty-nine tasks form the critical path; sequencing follows the DAG below.</p>
+<p><a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">2</a> shows the dependency DAG. Sub-phase A1.1 must complete before A1.2 (sources must exist before <code>clang</code> can run). A1.2 produces the AST and IR that A1.3 consumes for points-to and use-def analyses. A1.4 (dynamic analysis) is independent of A1.3 and may run in parallel. A1.5 packages the outputs of A1.2–A1.4 into the CAB.</p>
+<figure id="fig:dag" data-latex-placement="h">
+
+<figcaption>Dependency DAG of the analysis-phase sub-phases. A1.1 feeds A1.2 and A1.4; A1.3 consumes A1.2 outputs; A1.5 packages all outputs.</figcaption>
+</figure>
+<h2 data-number="11.7" id="definition-of-done"><span class="header-section-number">11.7</span> Definition of done</h2>
+<p>The Phase A deliverable is complete when all twenty-nine checkboxes are checked, the CAB validates against the schema, the function map covers every <code>libyaml</code> function, and the pattern catalog identifies at least three concrete occurrences of every idiom I1–I10. The CAB is then handed to the OSG stage (Stage 2 of the Ferrous Bridge pipeline) for ownership-classification refinement and translation-engine input.</p>
+<div class="thebibliography">
+<p><span>99</span></p>
+<p>M. Long. The Ferrous Bridge Knowledge Base. Magneton Labs / YonedaAI Research Collective, April 2026.</p>
+<p>Galois and Immunant. <em>c2rust: Migrate C99-compliant code to Rust</em>. <a href="https://github.com/immunant/c2rust" class="uri">https://github.com/immunant/c2rust</a>, v0.21, October 2025.</p>
+<p>C. Ellison and G. Roşu. An executable formal semantics of C with applications. In <em>POPL ’12</em>, pages 533–544, 2012.</p>
+<p>R. Krebbers. <em>The C Standard Formalized in Coq</em>. PhD thesis, Radboud University, 2015.</p>
+<p>K. Memarian, V. B. F. Gomes, B. Davis, S. Kell, A. Richardson, R. N. M. Watson, and P. Sewell. Exploring C semantics and pointer provenance. <em>Proc. ACM Program. Lang.</em>, 3(POPL):67:1–67:32, 2019.</p>
+<p>X. Leroy. Formal verification of a realistic compiler. <em>Communications of the ACM</em>, 52(7):107–115, 2009.</p>
+<p>H. Zhang, C. David, Y. Yu, and M. Wang. Ownership Guided C to Rust Translation. In <em>CAV 2023</em>, pages 459–482, 2023.</p>
+<p>M. Emre, R. Schroeder, K. Dewey, and B. Hardekopf. Translating C to Safer Rust. <em>Proc. ACM Program. Lang.</em>, 5(OOPSLA):1–29, 2023.</p>
+<p><em>SACTOR: LLM-Driven Correct and Idiomatic C to Rust Translation with Static Analysis and FFI-Based Verification</em>. Preprint, March 2025.</p>
+<p><em>RustMap: Dependency-Guided LLM C-to-Rust Translation</em>. Preprint, August 2025.</p>
+<p><em>Rustine: Fully-Automated Repository-Level C-to-Rust Translation</em>. Preprint, October 2025.</p>
+<p><em>ORBIT: Guided Agentic Orchestration for Autonomous C-to-Rust Transpilation</em>. Preprint, April 2026.</p>
+<p>R. Jung et al. Miri: Practical Undefined Behavior Detection for Rust. In <em>POPL 2026</em>, 2026.</p>
+<p>Amazon Web Services. <em>Kani Rust Verifier</em>. <a href="https://model-checking.github.io/kani/" class="uri">https://model-checking.github.io/kani/</a>, 2024.</p>
+<p>R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer. RustBelt: Securing the Foundations of the Rust Programming Language. <em>Proc. ACM Program. Lang.</em>, 2(POPL):66:1–66:34, 2018.</p>
+<p>W. Landi. Undecidability of static analysis. <em>ACM Lett. Program. Lang. Syst.</em>, 1(4):323–337, 1992.</p>
+<p>M. Long. Compile-Time Supremacy: A Strategic Architecture for AI-Assisted C<span class="math inline">\(\to\)</span>Rust Migration at Scale. GrokRxiv:2026.04.c2rust-compile-time-supremacy [cs.SE], April 2026.</p>
+<p>M. Long. Idiomatic Safe Rust for Streaming Parser Libraries: The <code>safe-libyaml</code> Target. GrokRxiv:2026.04.rust [cs.PL], April 2026 (forthcoming).</p>
+<p>M. Long. Automated C<span class="math inline">\(\to\)</span>Rust Transpiling: Pipeline, Patterns, and Verification. GrokRxiv:2026.04.c-rust-transpiling [cs.PL], April 2026 (forthcoming).</p>
+</div>

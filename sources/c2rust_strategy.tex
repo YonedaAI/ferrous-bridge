@@ -1,0 +1,587 @@
+\documentclass[11pt,a4paper]{article}
+
+% ======================== PACKAGES ========================
+\usepackage[margin=1in, left=1.35in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathrsfs}
+\usepackage[colorlinks=true,linkcolor=blue!70!black,citecolor=green!50!black,urlcolor=blue!80!black]{hyperref}
+\usepackage{setspace}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usepackage{tikz-cd}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{everypage}
+\usepackage{titling}
+% \usepackage{microtype}
+\usepackage{tabularx}
+\usepackage{longtable}
+
+\onehalfspacing
+
+% ============================================================
+% GrokRxiv DOI Sidebar
+% ============================================================
+\definecolor{grokgray}{RGB}{110,110,110}
+\AddEverypageHook{%
+  \ifnum\value{page}=1
+    \begin{tikzpicture}[remember picture, overlay]
+      \node[
+        rotate=90,
+        anchor=south,
+        font=\Large\sffamily\bfseries\color{grokgray},
+        inner sep=0pt
+      ] at ([xshift=38pt, yshift=0.52\paperheight]current page.south west)
+      {GrokRxiv:2026.04.c2rust-compile-time-supremacy\quad
+       [\,cs.SE\,]\quad
+       08 Apr 2026};
+    \end{tikzpicture}
+  \fi
+}
+
+% ============================================================
+% Theorem environments
+% ============================================================
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{principle}{Principle}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{corollary}{Corollary}[section]
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+% ============================================================
+% Headers
+% ============================================================
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Compile-Time Supremacy: AI-Assisted C$\to$Rust Migration}}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\begin{document}
+
+% ============================================================
+% TITLE BLOCK
+% ============================================================
+\begin{center}
+{\LARGE\bfseries Compile-Time Supremacy:\\[6pt]
+A Strategic Architecture for AI-Assisted\\[4pt]
+C$\to$Rust Migration at Scale}\\[20pt]
+{\large Matthew Long}\\[4pt]
+{\small The YonedaAI Collaboration}\\
+{\small YonedaAI Research Collective $\cdot$ Magneton Labs LLC}\\
+{\small Chicago, IL}\\[4pt]
+{\small \texttt{matthew@yonedaai.com} $\cdot$ \url{https://yonedaai.com}}\\[20pt]
+{\small April 8, 2026}
+\end{center}
+
+\vspace{10pt}
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+\noindent
+The convergence of three forces---DARPA's TRACTOR program, Microsoft's stated goal to eliminate all C/C++ by 2030, and the demonstrated capacity of large language models to generate and transform code---creates a once-in-a-generation commercial opportunity in automated C$\to$Rust translation. However, general-purpose LLMs are structurally insufficient for production-grade memory-safety migration. This paper presents a strategic architecture for building a specialized AI-assisted C$\to$Rust translation toolchain, grounded in the \textit{Compile-Time Supremacy} thesis: that the migration from C to Rust is fundamentally a problem of \textit{inferring missing type information} that C never required developers to state. We decompose the system into five pipeline stages, define the open-source and proprietary boundaries, specify the training data strategy including synthetic verified-pair generation, and outline a practical build path using Claude as the foundational reasoning engine augmented by specialized static analysis, formal verification, and domain-specific fine-tuned models. The architecture positions a new venture---\textbf{Ferrous Bridge}---to capture the emerging \$10B+ market in legacy code migration services.
+\end{abstract}
+
+\vspace{10pt}
+\hrule
+\vspace{15pt}
+
+% ============================================================
+% 1. THE THESIS
+% ============================================================
+\section{The Thesis: Compile-Time Supremacy as Business Strategy}
+
+\subsection{The Minimal Runtime Axiom Applied to Language Migration}
+
+The Minimal Runtime Axiom states: \textit{every invariant deferred to runtime is an invariant that will eventually be violated}. C is the canonical embodiment of maximal runtime deferral---raw pointer arithmetic, manual memory management, implicit type coercions, and undefined behavior all represent invariants that exist only in the programmer's mental model, never in the compiler's enforcement regime.
+
+Rust inverts this relationship. The borrow checker, lifetime system, and ownership model move invariants from ``trust the programmer'' to ``prove it at compile time.'' The entire C$\to$Rust migration is therefore not a syntactic translation problem but a \textit{type inference} problem: recovering the implicit ownership semantics, lifetime relationships, and aliasing constraints that C code encodes only in programmer intent.
+
+\begin{principle}[Compile-Time Supremacy]
+The economic value of C$\to$Rust migration is proportional to the quantity of implicit runtime invariants successfully promoted to compile-time enforcement. A translation that produces \texttt{unsafe} Rust wrapping C semantics creates zero security value. Only translation that \textbf{infers and encodes} the missing type information produces genuine memory safety.
+\end{principle}
+
+\subsection{Why General-Purpose LLMs Fail}
+
+General-purpose LLMs can perform surface-level C$\to$Rust translation with surprising quality on isolated functions. They fail systematically on the hard cases that constitute the actual security value:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Cross-function lifetime inference.} The lifetime of a pointer returned from function $f$ and consumed by function $g$ requires whole-program dataflow analysis. LLMs have a fixed context window and no persistent symbolic state.
+
+\item \textbf{Pointer aliasing.} C permits arbitrary aliasing; Rust's borrow checker enforces exclusivity. Determining which aliases are ``accidental'' (and can be refactored) versus ``essential'' (and require \texttt{RefCell} or \texttt{Arc}) requires semantic understanding of programmer intent.
+
+\item \textbf{Undefined behavior exploitation.} Compilers \textit{optimize based on UB assumptions}. Translated Rust code that naively preserves C behavior may preserve behavior that was never intended---the C compiler was silently exploiting UB for optimization.
+
+\item \textbf{Custom allocators and arena patterns.} Large C codebases implement bespoke memory management (arena allocators, slab allocators, pool allocators) that must be mapped to Rust's ownership model, not transliterated.
+
+\item \textbf{Verification of semantic equivalence.} The translated Rust must do what the C \textit{was supposed to do}, not what it \textit{actually did} (since what it actually did may include exploitable bugs). This requires a specification oracle that no LLM possesses natively.
+\end{enumerate}
+
+The conclusion: a specialized system must combine LLM reasoning with formal static analysis, dynamic testing, and human-in-the-loop verification. No single component suffices.
+
+
+% ============================================================
+% 2. MARKET ANALYSIS
+% ============================================================
+\section{Market Analysis: The C$\to$Rust Migration Opportunity}
+
+\subsection{Demand Signals}
+
+Three institutional demand signals converge simultaneously:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{DARPA TRACTOR} (2024--ongoing). \$5M+ awards to academic teams (Illinois/Wisconsin/Berkeley/Edinburgh). MIT Lincoln Lab performing T\&E. Explicit goal: automate C$\to$Rust at production quality. This validates the problem and creates a government procurement channel.
+
+\item \textbf{Microsoft's 2030 commitment.} Distinguished Engineer Galen Hunt's stated goal to eliminate all C/C++ from Microsoft by 2030. Internal team building AI agents targeting ``1 engineer, 1 month, 1 million lines.'' This validates enterprise demand at the largest possible scale.
+
+\item \textbf{White House ONCD directive.} The Office of the National Cyber Director's 2024 report calling for universal adoption of memory-safe languages. This creates regulatory pressure across the defense industrial base, critical infrastructure, and government contractors.
+\end{enumerate}
+
+\subsection{Market Sizing}
+
+\begin{table}[H]
+\centering
+\caption{C$\to$Rust Migration Market Segments}
+\begin{tabularx}{\textwidth}{lXrr}
+\toprule
+\textbf{Segment} & \textbf{Description} & \textbf{Lines (est.)} & \textbf{TAM} \\
+\midrule
+Defense/IC & DoD, intelligence community legacy systems & 5B+ & \$3--5B \\
+Enterprise OS & Windows, Linux kernel, Android native & 2B+ & \$2--4B \\
+Embedded/IoT & Automotive, medical devices, industrial control & 10B+ & \$3--6B \\
+Financial & Trading systems, banking infrastructure & 1B+ & \$1--2B \\
+Telecom & Network infrastructure, 5G stack & 2B+ & \$1--2B \\
+Open Source & OpenSSL, curl, nginx, etc. & 500M+ & \$200M--500M \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Total addressable market: \$10--20B over a 10-year migration cycle, with the critical constraint being that \textbf{no adequate tooling exists today}. The team that builds the first production-grade automated translator captures outsized first-mover advantage.
+
+\subsection{Competitive Landscape}
+
+\begin{table}[H]
+\centering
+\caption{Current C$\to$Rust Players}
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Player} & \textbf{Approach} & \textbf{Gap} \\
+\midrule
+Immunant (C2Rust) & AST-level transpilation, DARPA-funded & Produces \texttt{unsafe} Rust \\
+ForCLift (Berkeley) & Verified lifting, formal methods + LLM & Research stage \\
+Microsoft (internal) & AI agents at scale & Internal only \\
+Code Metal & Transpilation for edge hardware & Hardware focus \\
+General LLMs & Prompt-based translation & No verification \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The critical gap: \textbf{no current player combines LLM-powered semantic reasoning with formal verification and produces safe, idiomatic Rust.} Immunant's C2Rust produces mechanically correct but \texttt{unsafe} Rust. Academic approaches remain in research. Microsoft's tools are internal. The market is wide open for a productized solution.
+
+
+% ============================================================
+% 3. THE ARCHITECTURE
+% ============================================================
+\section{System Architecture: The Ferrous Bridge Pipeline}
+
+We propose a five-stage pipeline architecture named \textbf{Ferrous Bridge} (iron $\to$ iron oxide $\to$ the bridge from C to Rust). Each stage has distinct open-source and proprietary components.
+
+\subsection{Architecture Overview}
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    stage/.style={draw, rounded corners, minimum width=12cm, minimum height=1.2cm, font=\small\bfseries, align=center},
+    arrow/.style={->, thick, >=stealth},
+    label/.style={font=\scriptsize\itshape, text=gray}
+]
+\node[stage, fill=blue!8] (s1) {Stage 1: C Frontend Analysis};
+\node[stage, fill=green!8, below=of s1] (s2) {Stage 2: Semantic Graph Construction};
+\node[stage, fill=orange!8, below=of s2] (s3) {Stage 3: LLM-Powered Translation Engine};
+\node[stage, fill=red!8, below=of s3] (s4) {Stage 4: Formal Verification \& Equivalence Checking};
+\node[stage, fill=purple!8, below=of s4] (s5) {Stage 5: Human-in-the-Loop Refinement};
+
+\draw[arrow] (s1) -- (s2);
+\draw[arrow] (s2) -- (s3);
+\draw[arrow] (s3) -- (s4);
+\draw[arrow] (s4) -- (s5);
+\draw[arrow, dashed, bend right=50] (s4.west) to node[left, label] {rejection loop} (s3.west);
+\draw[arrow, dashed, bend left=50] (s5.east) to node[right, label] {annotation feedback} (s2.east);
+
+\node[right=0.3cm of s1, label] {Open Source};
+\node[right=0.3cm of s2, label] {Open + Proprietary};
+\node[right=0.3cm of s3, label] {Proprietary Core};
+\node[right=0.3cm of s4, label] {Open + Proprietary};
+\node[right=0.3cm of s5, label] {Proprietary Platform};
+\end{tikzpicture}
+\end{center}
+
+\subsection{Stage 1: C Frontend Analysis (Open Source)}
+
+\textbf{Purpose:} Parse C source into a rich intermediate representation that captures everything an LLM needs to reason about ownership and lifetimes.
+
+\textbf{Components:}
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Clang-based AST extraction} with full type information, macro expansion, and preprocessor resolution
+\item \textbf{LLVM IR emission} for optimization-level semantic analysis
+\item \textbf{Points-to analysis} (Andersen-style or Steensgaard) to build an initial aliasing graph
+\item \textbf{Call graph construction} with indirect call resolution via type-based devirtualization
+\item \textbf{Use-def chain extraction} for every pointer, with cross-function tracking
+\item \textbf{Dynamic analysis harness} using sanitizers (ASan, MSan, TSan) and fuzzing (libFuzzer, AFL++) to observe runtime behavior
+\end{itemize}
+
+\textbf{Open-source rationale:} This stage uses well-established compiler infrastructure. Open-sourcing it builds community trust, attracts contributors familiar with LLVM/Clang, and creates a funnel to the proprietary stages. It also satisfies DARPA's publication requirements for TRACTOR-adjacent work.
+
+\textbf{Output:} A \texttt{C-Analysis Bundle} (CAB)---a serialized JSON/protobuf package containing the AST, CFG, call graph, points-to graph, use-def chains, and dynamic analysis traces.
+
+\subsection{Stage 2: Semantic Graph Construction (Open Core + Proprietary)}
+
+\textbf{Purpose:} Transform the CAB into an \textit{Ownership Semantic Graph} (OSG)---a typed intermediate representation that makes implicit C ownership patterns explicit.
+
+\textbf{Key innovations:}
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Ownership inference engine.} For each pointer in the program, classify it as: \textit{owning} (will be freed by this scope), \textit{borrowing} (read-only reference to owned data), \textit{mutably borrowing} (exclusive mutable reference), or \textit{shared} (requires \texttt{Arc}/\texttt{Rc}). This is the core type-inference problem.
+\item \textbf{Lifetime region analysis.} Construct candidate Rust lifetime regions from use-def chains and dominator trees. Each region represents a borrow scope.
+\item \textbf{Allocator pattern recognition.} Detect arena, pool, slab, and custom allocator patterns and map them to idiomatic Rust equivalents (\texttt{bumpalo}, \texttt{typed-arena}, custom allocator API).
+\item \textbf{Idiom detection.} Recognize C patterns that map to Rust standard library idioms: linked lists $\to$ \texttt{Vec}, callback+context $\to$ closures, error-code returns $\to$ \texttt{Result<T, E>}.
+\end{itemize}
+
+\textbf{Open/proprietary split:}
+\begin{itemize}[leftmargin=2em]
+\item \textit{Open:} Graph data structures, serialization format, basic ownership heuristics
+\item \textit{Proprietary:} Trained ownership classifier, idiom detection models, allocator pattern library
+\end{itemize}
+
+\subsection{Stage 3: LLM-Powered Translation Engine (Proprietary Core)}
+
+\textbf{Purpose:} Given the OSG, generate safe, idiomatic Rust code at the function and module level.
+
+This is the proprietary heart of the system. The key insight is that the LLM is \textit{not} doing raw C$\to$Rust translation. It receives the C source \textit{annotated with the OSG's ownership/lifetime/idiom analysis}. The LLM's job is to synthesize Rust code that satisfies the inferred type constraints while preserving semantic equivalence.
+
+\textbf{Model architecture:}
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Base model:} Claude (via API) as the primary reasoning engine for complex translation decisions, architectural pattern recognition, and natural language explanation of translation choices.
+\item \textbf{Specialized fine-tuned model:} A smaller model (8--70B parameters) fine-tuned on verified C$\leftrightarrow$Rust translation pairs, optimized for high-throughput batch translation of routine code patterns. Candidate base: CodeLlama, StarCoder2, DeepSeek-Coder, or Qwen2.5-Coder.
+\item \textbf{Routing logic:} A classifier determines whether each translation unit should be routed to the fast fine-tuned model (routine patterns: simple functions, data structure translations, standard API mappings) or to Claude (complex patterns: lifetime inference across module boundaries, custom allocator migration, concurrent code transformation).
+\end{itemize}
+
+\textbf{Training data strategy for the fine-tuned model:}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Curated corpus.} Mine GitHub for projects that have been manually rewritten from C to Rust (e.g., \texttt{rustls} vs. OpenSSL, \texttt{sudo-rs} vs. sudo, \texttt{ntpd-rs} vs. ntpd). Extract function-level aligned pairs.
+\item \textbf{Synthetic generation via Claude.} Use Claude to translate C functions to Rust, then verify with \texttt{rustc} (type-checks), Miri (UB detection), and property-based tests. Verified pairs enter the training corpus.
+\item \textbf{C2Rust + manual refinement.} Run Immunant's C2Rust to produce \texttt{unsafe} Rust, then use Claude to ``safe-ify'' the output. Verify. The (C, unsafe-Rust, safe-Rust) triples are extremely high-value training data.
+\item \textbf{Adversarial generation.} Deliberately create C code with known memory safety bugs. Train the model to produce Rust code that \textit{does not reproduce the bug}---forcing it to infer programmer intent rather than transliterating behavior.
+\end{enumerate}
+
+\subsection{Stage 4: Formal Verification \& Equivalence Checking (Open Core + Proprietary)}
+
+\textbf{Purpose:} Prove that the generated Rust is semantically equivalent to the C source (modulo intentionally fixed bugs) and is genuinely memory-safe.
+
+\textbf{Components:}
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Rust compiler as oracle.} If \texttt{rustc} accepts the code without \texttt{unsafe} blocks, it is memory-safe by construction. This is the minimum bar.
+\item \textbf{Miri execution.} Run the Rust code under Miri (Rust's UB detector) to catch subtle issues the type system alone cannot.
+\item \textbf{Kani model checking.} Use Amazon's Kani to formally verify critical functions against specifications extracted from the C code's test suite and documentation.
+\item \textbf{Differential fuzzing.} Compile both the C and Rust versions, fuzz both with identical inputs, compare outputs. Divergence triggers a rejection loop back to Stage 3.
+\item \textbf{Creusot/Prusti verification.} For high-assurance targets (defense, medical, automotive), use Creusot or Prusti to generate formal proofs of functional correctness.
+\end{itemize}
+
+\textbf{Open/proprietary split:}
+\begin{itemize}[leftmargin=2em]
+\item \textit{Open:} Differential fuzzing harness, Miri integration, basic test generation
+\item \textit{Proprietary:} Specification extraction from C code, Kani proof orchestration, verification-guided re-translation logic
+\end{itemize}
+
+\subsection{Stage 5: Human-in-the-Loop Refinement (Proprietary Platform)}
+
+\textbf{Purpose:} A web-based IDE/dashboard where human Rust experts review, annotate, and approve translations. Every human decision feeds back into the training pipeline.
+
+\textbf{Features:}
+\begin{itemize}[leftmargin=2em]
+\item Side-by-side C/Rust diff view with OSG annotations
+\item Confidence scoring per translation unit (green/yellow/red)
+\item One-click approval that adds the verified pair to the training corpus
+\item Annotation tools for correcting ownership classifications, which retrain the Stage 2 classifier
+\item Audit trail for compliance (defense, automotive, medical certifications)
+\end{itemize}
+
+
+% ============================================================
+% 4. OPEN/CLOSED BOUNDARY
+% ============================================================
+\section{Open Source vs.\ Proprietary Boundary}
+
+The open/closed boundary is the strategic crux. The principle: \textbf{open-source the infrastructure that creates ecosystem lock-in; keep proprietary the intelligence that creates competitive advantage}.
+
+\begin{table}[H]
+\centering
+\caption{Open/Proprietary Component Map}
+\begin{tabularx}{\textwidth}{lXcc}
+\toprule
+\textbf{Component} & \textbf{Description} & \textbf{Open} & \textbf{Closed} \\
+\midrule
+Clang/LLVM frontend & AST/IR extraction, points-to analysis & \checkmark & \\
+CAB format spec & Serialization format for analysis bundles & \checkmark & \\
+OSG data structures & Ownership graph representation & \checkmark & \\
+Ownership classifier & ML model for pointer classification & & \checkmark \\
+Idiom detection engine & Pattern matching for C$\to$Rust idioms & & \checkmark \\
+Fine-tuned code model & Specialized C$\to$Rust translation LLM & & \checkmark \\
+Claude integration layer & Routing, prompt engineering, orchestration & & \checkmark \\
+Differential fuzzing harness & Equivalence testing framework & \checkmark & \\
+Miri/Kani integration & Verification pipeline connectors & \checkmark & \\
+Specification extractor & Infer specs from tests and docs & & \checkmark \\
+Verification orchestrator & Proof strategy selection and execution & & \checkmark \\
+Training data pipeline & Synthetic pair generation and curation & & \checkmark \\
+Human review platform & Web IDE for expert review & & \checkmark \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Strategic Rationale}
+
+\textbf{Why open-source the frontend:} The C analysis infrastructure benefits from community contribution. Every contributor who builds on our CAB format is a potential customer for the proprietary translation engine. The format becomes a standard, creating switching costs. DARPA and government buyers strongly prefer open-source infrastructure components.
+
+\textbf{Why keep the models proprietary:} The fine-tuned translation model and ownership classifier are the competitive moat. Training data (verified C$\leftrightarrow$Rust pairs) is expensive to generate and curate. The Claude integration layer embodies accumulated prompt engineering and routing intelligence that represents months of iteration.
+
+\textbf{Why open-source the verification harness:} Trust. Defense and enterprise buyers will not trust a black-box translator. Open-sourcing the verification pipeline lets them audit the correctness guarantees independently while still requiring the proprietary engine to generate the code being verified.
+
+
+% ============================================================
+% 5. BUILDING WITH CLAUDE
+% ============================================================
+\section{Building with Claude: The Practical Path}
+
+\subsection{Claude's Role in the Architecture}
+
+Claude serves three distinct functions in the Ferrous Bridge pipeline:
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Complex translation oracle.} For translation units that exceed the fine-tuned model's confidence threshold---typically those involving cross-module lifetime inference, custom allocator migration, or concurrent code---Claude receives the C source annotated with the OSG and generates candidate Rust translations. Claude's strength is reasoning about \textit{programmer intent} from context, comments, variable names, and architectural patterns.
+
+\item \textbf{Synthetic training data generator.} Claude generates candidate C$\to$Rust translations at scale. Each candidate is verified by the Stage 4 pipeline. Verified pairs are added to the fine-tuned model's training corpus. This creates a \textit{distillation flywheel}: Claude's reasoning ability is progressively distilled into the smaller, faster, cheaper fine-tuned model.
+
+\item \textbf{Explanation engine.} For the human-in-the-loop stage, Claude generates natural language explanations of \textit{why} each translation decision was made. This is critical for defense and regulated industry buyers who require audit trails and justifications.
+\end{enumerate}
+
+\subsection{Claude Code as Development Accelerator}
+
+The development of Ferrous Bridge itself should be built using Claude Code with agent teams:
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Agent Team 1: Frontend.} Builds the Clang-based analysis pipeline. Claude Code agents write the AST extraction, points-to analysis, and CAB serialization code.
+\item \textbf{Agent Team 2: OSG Engine.} Implements the ownership semantic graph construction. Agents write the ownership classifier, lifetime region analysis, and idiom detection.
+\item \textbf{Agent Team 3: Translation.} Builds the Claude API integration, prompt templates, routing logic, and fine-tuning data pipeline.
+\item \textbf{Agent Team 4: Verification.} Implements the differential fuzzing, Miri/Kani integration, and verification orchestration.
+\item \textbf{RalphD as meta-supervisor.} Monitors drift across all four agent teams, ensuring architectural consistency, enforcing the OSG schema contract, and detecting when agents diverge from the design spec.
+\end{itemize}
+
+\subsection{Phase 1: MVP (Months 1--3)}
+
+\begin{enumerate}[leftmargin=2em]
+\item Stand up the Clang frontend. Parse a curated set of 50 small-to-medium C projects (\textless 10K LOC each). Emit CABs.
+\item Build a minimal OSG with manual ownership annotations. No ML yet---use heuristics (e.g., ``if \texttt{malloc} and \texttt{free} are in the same function, it's owning'').
+\item Integrate Claude API. For each function in the CAB, send C source + OSG annotations to Claude with a carefully engineered prompt. Collect Rust output.
+\item Run \texttt{rustc} on every output. Measure: (a) compilation success rate, (b) percentage of \texttt{unsafe} blocks, (c) differential fuzzing pass rate.
+\item \textbf{Target:} 60\% compilation success, \textless 20\% unsafe blocks on simple projects.
+\end{enumerate}
+
+\subsection{Phase 2: Training Data Flywheel (Months 4--8)}
+
+\begin{enumerate}[leftmargin=2em]
+\item Use Phase 1 results to build the initial training corpus. Every Claude-generated translation that passes verification becomes a training pair.
+\item Fine-tune a code model (starting with DeepSeek-Coder-V2 or Qwen2.5-Coder-32B) on the verified pairs.
+\item Build the routing classifier: simple functions go to the fine-tuned model, complex functions go to Claude.
+\item Scale to 500 projects. Build the ownership classifier using supervised learning on the manually annotated OSGs from Phase 1.
+\item \textbf{Target:} 80\% compilation success, fine-tuned model handles 70\% of functions, Claude handles 30\%.
+\end{enumerate}
+
+\subsection{Phase 3: Verification and Productization (Months 9--14)}
+
+\begin{enumerate}[leftmargin=2em]
+\item Integrate Kani for formal verification of critical functions.
+\item Build the human review platform (web IDE).
+\item Launch beta with 3--5 design partners (defense contractors, embedded systems companies).
+\item Apply to DARPA TRACTOR as a performer or subcontractor.
+\item Open-source the frontend and verification harness.
+\item \textbf{Target:} 90\%+ compilation success, \textless 5\% unsafe blocks, formal verification on critical paths.
+\end{enumerate}
+
+\subsection{Phase 4: Scale and Defensibility (Months 15--24)}
+
+\begin{enumerate}[leftmargin=2em]
+\item Continuous fine-tuning from human review feedback (every approved translation improves the model).
+\item Expand to C++ (significantly harder---templates, RAII overlap, virtual dispatch).
+\item Build domain-specific modules: automotive (MISRA C compliance), medical (IEC 62304), defense (DO-178C).
+\item Pursue SBIR/STTR funding for defense-specific applications.
+\item \textbf{Target:} 95\%+ success on C, initial C++ support, 3+ paying enterprise customers.
+\end{enumerate}
+
+
+% ============================================================
+% 6. TRAINING DATA STRATEGY
+% ============================================================
+\section{Training Data Strategy: The Verified Pair Problem}
+
+The fundamental bottleneck is training data. There are approximately 100x more C code samples than Rust in public repositories, and aligned C$\leftrightarrow$Rust translation pairs are extremely scarce. The strategy is synthetic generation with formal verification as the quality gate.
+
+\subsection{Data Sources}
+
+\begin{enumerate}[leftmargin=2em]
+\item \textbf{Natural rewrites.} Projects that have been manually rewritten from C to Rust: \texttt{rustls}/OpenSSL, \texttt{sudo-rs}/sudo, \texttt{ntpd-rs}/ntpd, \texttt{hickory-dns}/BIND. Function-level alignment yields approximately 5,000--10,000 high-quality pairs.
+
+\item \textbf{C2Rust + safe-ification.} Run C2Rust on open-source C projects. The output is mechanically correct \texttt{unsafe} Rust. Use Claude to generate safe Rust equivalents. Verify with \texttt{rustc} + Miri + differential fuzzing. This can generate 50,000--100,000 pairs at moderate cost.
+
+\item \textbf{Pure synthetic generation.} Generate C functions from templates covering known difficulty patterns (linked lists, trees, hash maps, arena allocators, callback patterns, signal handlers). Translate with Claude. Verify. 100,000+ pairs possible.
+
+\item \textbf{Adversarial pairs.} C code containing \textit{known bugs} (CVEs from NVD, synthetic buffer overflows, use-after-free). The correct Rust translation must \textit{not} reproduce the bug. These pairs train the model to infer intent, not transliterate behavior.
+\end{enumerate}
+
+\subsection{Verification Pipeline for Training Data}
+
+Every candidate training pair $(C_i, R_i)$ must pass:
+\begin{enumerate}[leftmargin=2em]
+\item $R_i$ compiles with \texttt{rustc} (no errors).
+\item $R_i$ contains zero \texttt{unsafe} blocks (or minimally scoped, justified \texttt{unsafe}).
+\item $R_i$ passes Miri with no UB detected.
+\item Differential fuzzing: $\text{output}(C_i, x) = \text{output}(R_i, x)$ for $10^4$ random inputs $x$.
+\item $R_i$ passes Clippy with no warnings (idiomatic Rust check).
+\item $R_i$'s cyclomatic complexity is within 2x of a human-written equivalent (readability check).
+\end{enumerate}
+
+Pairs that pass all six gates enter the training corpus. Pairs that fail gate 4 (semantic equivalence) are discarded. Pairs that fail gates 5--6 (idiomaticity) are flagged for human review.
+
+
+% ============================================================
+% 7. ECONOMICS
+% ============================================================
+\section{Unit Economics and Business Model}
+
+\subsection{Pricing Model}
+
+\begin{table}[H]
+\centering
+\caption{Pricing Tiers}
+\begin{tabularx}{\textwidth}{lXr}
+\toprule
+\textbf{Tier} & \textbf{Description} & \textbf{Price} \\
+\midrule
+Open Source & Frontend analysis + CAB format + verification harness & Free \\
+Developer & Fine-tuned model API, 10K LOC/month, basic verification & \$500/mo \\
+Professional & Claude-augmented translation, 100K LOC/month, full verification & \$5,000/mo \\
+Enterprise & Unlimited, dedicated instance, human review platform, SLA & \$50K+/mo \\
+Defense & Air-gapped deployment, formal verification, DO-178C/IEC 62304 & Custom \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Unit Economics}
+
+\begin{itemize}[leftmargin=2em]
+\item \textbf{Cost per function translation (fine-tuned model):} \$0.001--0.01 (inference cost on hosted GPU)
+\item \textbf{Cost per function translation (Claude):} \$0.05--0.50 (API cost, depending on context length)
+\item \textbf{Cost per verified pair (training data):} \$0.10--1.00 (Claude generation + verification compute)
+\item \textbf{Target gross margin:} 70--85\% at scale (after fine-tuned model handles majority of volume)
+\end{itemize}
+
+The distillation flywheel is the key to unit economics: as the fine-tuned model improves, more functions route to it instead of Claude, reducing marginal cost while maintaining quality.
+
+
+% ============================================================
+% 8. RISK ANALYSIS
+% ============================================================
+\section{Risk Analysis}
+
+\begin{table}[H]
+\centering
+\caption{Risk Matrix}
+\begin{tabularx}{\textwidth}{lXll}
+\toprule
+\textbf{Risk} & \textbf{Description} & \textbf{Likelihood} & \textbf{Mitigation} \\
+\midrule
+LLM plateau & Translation quality hits ceiling & Medium & Formal methods compensate \\
+Microsoft competition & Internal tools released externally & High & Speed to market, defense niche \\
+Rust evolution & Borrow checker changes break tools & Low & Track Rust RFC process \\
+DARPA pivots & TRACTOR defunded or redirected & Low & Commercial customers primary \\
+Training data IP & Copyright issues with mined pairs & Medium & Focus on synthetic generation \\
+False equivalence & Verified translations contain subtle bugs & High & Multi-layer verification \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+% ============================================================
+% 9. TECHNICAL FOUNDATIONS
+% ============================================================
+\section{Technical Foundations: Type Theory of the Translation}
+
+\subsection{The Translation as Type Enrichment}
+
+Let $\mathcal{C}$ denote the type system of C and $\mathcal{R}$ denote the type system of Rust. The C type system is a \textit{subsystem} of Rust's in a precise sense: every C type has a Rust equivalent, but Rust's type system includes additional structure (lifetimes, ownership, trait bounds) that C lacks.
+
+\begin{definition}[Type Enrichment]
+A C$\to$Rust translation is a functor $T: \mathcal{C} \to \mathcal{R}$ that maps each C type $\tau_C$ to a Rust type $T(\tau_C)$ such that:
+\begin{enumerate}
+\item $T$ preserves the data layout: $\text{sizeof}(\tau_C) = \text{sizeof}(T(\tau_C))$
+\item $T$ adds lifetime annotations: if $\tau_C = \text{int*}$, then $T(\tau_C) = \texttt{\&'a i32}$ for some lifetime $\texttt{'a}$
+\item $T$ adds ownership semantics: if $\tau_C$ is a heap pointer, $T(\tau_C) \in \{\texttt{Box<T>}, \texttt{Rc<T>}, \texttt{Arc<T>}, \texttt{\&T}, \texttt{\&mut T}\}$
+\end{enumerate}
+\end{definition}
+
+The hard problem is that $T$ is not unique---there are many valid Rust types for each C pointer. The correct choice depends on usage context, which is exactly the information that a general-purpose LLM lacks but the OSG provides.
+
+\subsection{Connection to the Yoneda Perspective}
+
+From the Yoneda lemma's perspective, a C pointer is fully characterized by \textit{how it is used}---the set of all operations applied to it across the program. The ownership classification in Stage 2 is precisely the construction of this representable functor: we observe all uses of a pointer (its ``Yoneda image'') and infer the minimal Rust type that supports exactly those uses.
+
+\begin{theorem}[Yoneda Ownership Inference]
+Let $p$ be a pointer in a C program $P$, and let $U(p) = \{u_1, \ldots, u_n\}$ be the set of all operations applied to $p$ across $P$. The correct Rust ownership type for $p$ is the \textbf{minimal} Rust type $\tau$ such that $\text{Hom}_{\mathcal{R}}(\tau, -) \supseteq U(p)$.
+\end{theorem}
+
+This is the Compile-Time Supremacy principle expressed category-theoretically: the entire C$\to$Rust translation reduces to computing the Yoneda embedding of each pointer's usage pattern into Rust's type lattice.
+
+
+% ============================================================
+% 10. CONCLUSION
+% ============================================================
+\section{Conclusion}
+
+The C$\to$Rust migration opportunity is real, immediate, and structurally favored by government mandate, enterprise commitment, and technological readiness. The thesis is simple: \textit{general-purpose LLMs cannot solve this problem alone, but a hybrid system combining LLM reasoning with static analysis, formal verification, and progressive distillation can}.
+
+The Ferrous Bridge architecture---open-source infrastructure creating ecosystem lock-in, proprietary intelligence creating competitive advantage, Claude as the reasoning backbone progressively distilled into specialized models---represents a practical path to capturing this market.
+
+The build path is concrete: 14 months to a production beta, using Claude Code agent teams for development, Claude API for translation, and a formal verification pipeline as the quality gate. The open-source components create community and trust. The proprietary components create defensibility and margin.
+
+The Compile-Time Supremacy thesis provides the theoretical grounding: every line of C translated to safe Rust is an invariant promoted from runtime hope to compile-time proof. The business captures value proportional to the security value created. And the Yoneda perspective reveals why this works at a foundational level: the correct Rust type for any C construct is determined by \textit{how that construct is used}, which is precisely the information that a well-designed analysis pipeline can extract and a well-trained model can interpret.
+
+The market window is open. DARPA is funding. Microsoft is building internally. The tooling gap is acute. The time to build is now.
+
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\section*{References}
+
+\begin{enumerate}[leftmargin=2em, label={[\arabic*]}]
+\item DARPA. ``TRACTOR: Translating All C to Rust.'' \url{https://www.darpa.mil/research/programs/translating-all-c-to-rust}, 2024.
+\item ONCD. ``Back to the Building Blocks: A Path Toward Secure and Measurable Software.'' White House Office of the National Cyber Director, 2024.
+\item Chandrasekaran, V. et al. ``ForCLift: Formally-Verified Compositional Lifting of C to Rust.'' DARPA TRACTOR Award, 2025.
+\item Immunant. ``C2Rust: C to Rust Translation Framework.'' \url{https://c2rust.com}, 2024.
+\item Hunt, G. ``Eliminating C and C++ from Microsoft by 2030.'' LinkedIn, December 2025.
+\item Long, M. ``The Minimal Runtime Axiom: Compile-Time Supremacy as a Foundational Principle.'' YonedaAI Research Collective, 2025.
+\item Long, M. ``ContextFS: A Type Memory Database for AI Agent Systems.'' YonedaAI Research Collective, 2025.
+\item Matsakis, N. and Klock, F. ``The Rust Language.'' \textit{ACM SIGADA Ada Letters}, 34(3), 2014.
+\item Jung, R. et al. ``RustBelt: Securing the Foundations of the Rust Programming Language.'' \textit{POPL}, 2018.
+\item Amazon Web Services. ``Kani Rust Verifier.'' \url{https://github.com/model-checking/kani}, 2023.
+\item Denis, X. et al. ``Creusot: A Foundry for the Deductive Verification of Rust Programs.'' \textit{ICFEM}, 2022.
+\item CISA et al. ``The Case for Memory Safe Roadmaps.'' Joint cybersecurity advisory, 2023.
+\end{enumerate}
+
+\end{document}

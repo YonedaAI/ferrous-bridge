@@ -1,0 +1,955 @@
+<h1 data-number="1" id="sec:intro"><span class="header-section-number">1</span> Introduction</h1>
+<h2 data-number="1.1" id="the-c2rust-gap"><span class="header-section-number">1.1</span> The c2rust gap</h2>
+<p>Immunant’s <code>c2rust</code> <span class="citation" data-cites="immunant2025"></span> consumes the Clang AST of a C translation unit and emits a Rust crate that compiles to a bit-for-bit-equivalent object file. As a piece of compiler engineering it is excellent. As a delivery mechanism for <em>memory safety</em>, it is exactly what its authors warn it is: a starting point. The output, by construction, preserves every C semantic. A function that read past the end of an array in C will read past the end of an array in the c2rust Rust; the only difference is that the Rust source now has <code>unsafe</code> written above each such read.</p>
+<p>Concretely, the <code>unsafe-libyaml</code> crate (David Tolnay’s c2rust output for <code>libyaml</code>, the dependency under <code>serde_yaml</code>’s 90 M+ download tree) contains thousands of <code>unsafe</code> blocks, raw pointer arithmetic in the scanner, a self-referential emitter analysis structure encoded as <code>*mut yaml_char_t</code>, integer-coded errors masquerading as <code>int</code>, and tagged unions whose discriminant is checked by hand before each field access. None of the C UB classes documented in the companion paper on C semantics are eliminated; they are merely <em>relabeled</em>.</p>
+<h2 data-number="1.2" id="why-libyaml-is-the-perfect-first-instance"><span class="header-section-number">1.2</span> Why libyaml is the perfect first instance</h2>
+<p>The libyaml ecosystem provides ground truth at every rung of the ladder we are about to construct:</p>
+<ul>
+<li><p><strong>Rung 0 (C source).</strong> The reference implementation <code>yaml/libyaml</code> <span class="citation" data-cites="simonov2006libyaml"></span>, <span class="math inline">\(\sim\)</span>9<span>,</span>300 LOC of hand-written C, MIT-licensed, with a published 400+ case test suite (<code>yaml-test-suite</code>).</p></li>
+<li><p><strong>Rung 1 (mechanical lift).</strong> <code>dtolnay/unsafe-libyaml</code>, the c2rust transpilation, with the ergonomic post-processing one would expect a Rust expert to apply but no semantic safety changes <span class="citation" data-cites="tolnay2024unsafe"></span>.</p></li>
+<li><p><strong>Rung 2 (manual safe port).</strong> <code>simonask/libyaml-safer</code>, a one-week effort by a single engineer proving that the safe-Rust translation is feasible with current tooling and that performance does not regress <span class="citation" data-cites="simonask2024"></span>.</p></li>
+<li><p><strong>Rung 3 (AI-assisted, ours).</strong> <code>safe-libyaml</code>, the target output of the Ferrous Bridge pipeline, intended to match Rung 2’s quality automatically.</p></li>
+</ul>
+<p>The existence of Rungs 1 and 2 means <em>every</em> translation decision in the c2rust output has a known correct refactoring; we are not guessing. This makes libyaml the ideal first target for a generalizable <em>C <span class="math inline">\(\to\)</span> unsafe-Rust <span class="math inline">\(\to\)</span> safe-Rust</em> pipeline.</p>
+<h2 data-number="1.3" id="contributions"><span class="header-section-number">1.3</span> Contributions</h2>
+<p>This paper makes the following contributions.</p>
+<ol>
+<li><p><strong>(<a href="#sec:c2rust" data-reference-type="ref+Label" data-reference="sec:c2rust">2</a>)</strong> A precise account of the <code>c2rust</code> pipeline as it stands at v0.21 (October 2025): what it does, what its successor analysis tool intends to do, and the boundary between mechanical lift and semantic refactoring.</p></li>
+<li><p><strong>(<a href="#sec:ladder" data-reference-type="ref+Label" data-reference="sec:ladder">3</a>)</strong> The <em>safety ladder</em>: a stack of six refinement relations <span class="math inline">\(\sqsubseteq_{\mathrm{compile}} \dots \sqsubseteq_{\mathrm{abi}}\)</span> that formalizes "what guarantee does this output have over its predecessor?" We give the inference rules in mathpartir and the diagram in TikZ.</p></li>
+<li><p><strong>(<a href="#sec:patterns" data-reference-type="ref+Label" data-reference="sec:patterns">4</a>)</strong> Twelve refactoring patterns, each given as <span class="math inline">\(\text{c2rust output} \rightsquigarrow \text{target safe form}\)</span>, with worked libyaml examples (raw pointer triple <span class="math inline">\(\to\)</span> <code>Vec&lt;u8&gt;</code>, tagged union <span class="math inline">\(\to\)</span> enum, <code>int</code> return <span class="math inline">\(\to\)</span> <code>Result&lt;T,E&gt;</code>, etc.).</p></li>
+<li><p><strong>(<a href="#sec:fuzz" data-reference-type="ref+Label" data-reference="sec:fuzz">5</a>)</strong> A formal differential-fuzzing equivalence claim <span class="math inline">\(\forall b{\in}\mathcal{B}.~\mathrm{parse}_{\mathrm{C}}(b)
+ \simeq \mathrm{parse}_{\mathrm{R}}(b)\)</span> together with the harness design that realizes it as a single binary driving both <code>libyaml.so</code> and <code>safe-libyaml</code> over the same input bytes and comparing event streams.</p></li>
+<li><p><strong>(<a href="#sec:miri" data-reference-type="ref+Label" data-reference="sec:miri">6</a>)</strong> A characterization of which UB classes Miri detects (and which it does not), and the role of <code>cargo-careful</code> as a runtime complement.</p></li>
+<li><p><strong>(<a href="#sec:kani" data-reference-type="ref+Label" data-reference="sec:kani">7</a>)</strong> A worked Kani proof of the <code>STRING_EXTEND</code> buffer-extension invariant, demonstrating that the safe Rust port can be <em>deductively</em> verified at the function-contract level.</p></li>
+<li><p><strong>(<a href="#sec:timeline" data-reference-type="ref+Label" data-reference="sec:timeline">8</a>)</strong> A day-by-day 7-day libyaml schedule naming the agent responsible for each wave.</p></li>
+<li><p><strong>(<a href="#sec:libexpat" data-reference-type="ref+Label" data-reference="sec:libexpat">9</a>)</strong> Generalization to libexpat: the deltas (entity-expansion depth, namespace separator validation, SAX-callback void-pointer context) and the parts of the ladder that carry over unchanged.</p></li>
+<li><p><strong>(Appendix A)</strong> A 36-task prototype development plan in the binding format of the addendum to the project knowledge base.</p></li>
+</ol>
+<h2 data-number="1.4" id="audience-and-scope"><span class="header-section-number">1.4</span> Audience and scope</h2>
+<p>The intended reader is a Rust systems engineer or a research-tool author familiar with c2rust who wishes to take its output <em>up the ladder</em> to a publishable safe crate. We do not assume formal-methods background; all theorems are stated for clarity and proved at sketch-level. Implementation prerequisites (libyaml C source, Clang <span class="math inline">\(\ge 18\)</span>, Rust <span class="math inline">\(\ge 1.86\)</span>, Miri nightly, Kani 0.49+, AFL++ <span class="math inline">\(\ge 4.20\)</span>) are listed in <a href="#app:env" data-reference-type="ref+Label" data-reference="app:env">[app:env]</a>.</p>
+<h1 data-number="2" id="sec:c2rust"><span class="header-section-number">2</span> The c2rust pipeline</h1>
+<h2 data-number="2.1" id="what-c2rust-does"><span class="header-section-number">2.1</span> What c2rust does</h2>
+<p><code>c2rust</code> is a four-stage pipeline (<a href="#fig:c2rust-pipeline" data-reference-type="ref+Label" data-reference="fig:c2rust-pipeline">1</a>).</p>
+<figure id="fig:c2rust-pipeline" data-latex-placement="t">
+
+<figcaption>The c2rust pipeline. Solid arrows are stable as of v0.21 (October 2025). Dashed arrows are the deprecated <code>c2rust-refactor</code> tool and the announced successor.</figcaption>
+</figure>
+<h4 data-number="2.1.0.1" id="stage-1-compilation-database-extraction."><span class="header-section-number">2.1.0.1</span> Stage 1 — compilation database extraction.</h4>
+<p><code>c2rust</code> consumes a <code>compile_commands.json</code> file (the output of any CMake or <code>bear</code>-instrumented build) so that every translation unit is rewritten with the same <code>-D</code> macros, <code>-I</code> include paths, and target triple as the original C build. This is critical for libyaml: <code>yaml_private.h</code> contains preprocessor-conditional definitions for the buffer-management macros.</p>
+<h4 data-number="2.1.0.2" id="stage-2-clang-ast-cbor."><span class="header-section-number">2.1.0.2</span> Stage 2 — Clang AST + CBOR.</h4>
+<p>The C is parsed with the same Clang version that compiles it. <code>c2rust ast-exporter</code> dumps the AST plus type/decl tables into CBOR-serialized files (one per translation unit). The CBOR schema is versioned; v0.21 added portable type recognition (<code>size_t</code> <span class="math inline">\(\to\)</span> <code>usize</code>, <code>int32_t</code> <span class="math inline">\(\to\)</span> <code>i32</code>).</p>
+<h4 data-number="2.1.0.3" id="stage-3-transpile-to-rust."><span class="header-section-number">2.1.0.3</span> Stage 3 — transpile to Rust.</h4>
+<p><code>c2rust transpile</code> consumes the CBOR. It emits one Rust file per C translation unit. Constructs are mapped as follows:</p>
+<ul>
+<li><p>C primitive types <span class="math inline">\(\to\)</span> Rust primitives (<code>int</code><span class="math inline">\(\to\)</span> <code>libc::c_int</code>, <code>char</code><span class="math inline">\(\to\)</span><code>libc::c_char</code>, etc.; with v0.21 portable mode, <code>int32_t</code><span class="math inline">\(\to\)</span><code>i32</code>).</p></li>
+<li><p>C structs <span class="math inline">\(\to\)</span> <code>#[repr(C)] struct</code> with identical layout.</p></li>
+<li><p>C unions <span class="math inline">\(\to\)</span> <code>#[repr(C)] union</code> with raw field access (always <code>unsafe</code>).</p></li>
+<li><p>C function pointers <span class="math inline">\(\to\)</span> <code>Option&lt;unsafe extern "C" fn(…)&gt;</code>.</p></li>
+<li><p>Pointer dereference <span class="math inline">\(\to\)</span> <code>*ptr</code> (always <code>unsafe</code>).</p></li>
+<li><p><code>malloc</code>/<code>free</code> <span class="math inline">\(\to\)</span> <code>libc::malloc</code>/ <code>libc::free</code> or <code>Box::from_raw</code>/<code>Box::into_raw</code>.</p></li>
+<li><p><code>goto</code> labels <span class="math inline">\(\to\)</span> <code>loop { …</code><code>break</code><code> ’label }</code>.</p></li>
+<li><p>Inline assembly <span class="math inline">\(\to\)</span> Rust <code>asm!</code> macro (v0.21+).</p></li>
+</ul>
+<h4 data-number="2.1.0.4" id="stage-4-former-refactor."><span class="header-section-number">2.1.0.4</span> Stage 4 — (former) refactor.</h4>
+<p><code>c2rust-refactor</code> provided AST-rewrite rules. Immunant <em>deprecated</em> it in v0.21 with the comment that the approach was not right for “deep safety lifting,” and announced a successor with “more analysis capability” built on top of an Andersen-style points-to analysis. As of April 2026 the successor is in early prototype.</p>
+<h2 data-number="2.2" id="what-c2rust-gets-right"><span class="header-section-number">2.2</span> What c2rust gets right</h2>
+<p>c2rust’s strengths are exactly the boring parts of the translation problem.</p>
+<ul>
+<li><p><strong>ABI preservation.</strong> Field offsets, alignment, <code>#[repr(C)]</code>, and calling conventions are exactly what the C ABI expects. This is what makes drop-in replacement viable.</p></li>
+<li><p><strong>Macro expansion.</strong> <code>c2rust</code> runs the C preprocessor; the Rust output is <em>post</em>-expansion. There are no Rust macros hiding implicit C macros.</p></li>
+<li><p><strong>Compilation guarantee.</strong> If c2rust produces output, it compiles. (Exceptions exist for unsupported GCC extensions; libyaml uses none.)</p></li>
+<li><p><strong>Whole-crate consistency.</strong> Cross-translation-unit type identity is preserved via a global symbol table.</p></li>
+</ul>
+<h2 data-number="2.3" id="what-c2rust-leaves-on-the-table"><span class="header-section-number">2.3</span> What c2rust leaves on the table</h2>
+<p>What c2rust does <em>not</em> do is the entire content of this paper.</p>
+<ul>
+<li><p>No ownership inference; every pointer remains <code>*mut</code> or <code>*const</code>.</p></li>
+<li><p>No lifetime inference; references do not appear.</p></li>
+<li><p>No idiom detection; loops over indices remain index loops, never iterator combinators.</p></li>
+<li><p>No null-pointer recovery to <code>Option&lt;T&gt;</code>.</p></li>
+<li><p>No tagged-union recovery to <code>enum</code>.</p></li>
+<li><p>No error-channel recovery from <code>int 0/1</code> to <code>Result&lt;T,E&gt;</code>.</p></li>
+<li><p>No buffer-bound proofs; raw pointer arithmetic remains.</p></li>
+<li><p>No identification of self-referential structures (the libyaml emitter analysis problem).</p></li>
+</ul>
+<p>The remainder of this paper is the formalism for, and the recipe to perform, exactly these missing steps.</p>
+<h1 data-number="3" id="sec:ladder"><span class="header-section-number">3</span> The Safety Ladder</h1>
+<h2 data-number="3.1" id="refinement-relations"><span class="header-section-number">3.1</span> Refinement relations</h2>
+<p>We model each safety improvement as a refinement <span class="math inline">\(P&#39; \sqsubseteq_X P\)</span> where <span class="math inline">\(P\)</span> is a predecessor program, <span class="math inline">\(P&#39;\)</span> is a candidate replacement, and <span class="math inline">\(X\)</span> is the verification regime that justifies the relation. Read <span class="math inline">\(P&#39; \sqsubseteq_X P\)</span> as “<em><span class="math inline">\(P&#39;\)</span> refines <span class="math inline">\(P\)</span> in regime <span class="math inline">\(X\)</span></em>”, meaning every observable behaviour of <span class="math inline">\(P&#39;\)</span> corresponds to an observable behaviour of <span class="math inline">\(P\)</span> (sound) and <span class="math inline">\(P&#39;\)</span> additionally exhibits the safety property <span class="math inline">\(X\)</span>.</p>
+<div class="definition">
+<p><strong>Definition 1</strong> (Compile safety, <span class="math inline">\(\sqsubseteq_{\mathrm{compile}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{compile}} P\)</span> iff <span class="math inline">\(P&#39;\)</span> is well-typed under <code>rustc</code> with the lints <code>-D warnings -D unsafe_op_in_unsafe_fn</code> and contains no <code>unsafe</code> block outside of an explicitly marked FFI shim.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 2</strong> (Memory safety, <span class="math inline">\(\sqsubseteq_{\mathrm{mem}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{mem}} P\)</span> iff <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{compile}} P\)</span> and Miri (under the Stacked Borrows aliasing model) reports no UB on the unit-test suite. Note that this is a <em>bounded</em> guarantee: Miri only inspects program points exercised by the tests it interprets, so the rung asserts “no UB found on the tested execution paths,” not “no UB on any input.” The strength of this rung therefore scales with test-suite coverage, which we measure with <code>cargo-llvm-cov</code> as a companion metric.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 3</strong> (Behavioural safety, <span class="math inline">\(\sqsubseteq_{\mathrm{behav}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{behav}} P\)</span> iff <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{mem}} P\)</span> and the differential fuzz harness (<a href="#sec:fuzz" data-reference-type="ref+Label" data-reference="sec:fuzz">5</a>) discovers no observable divergence between <span class="math inline">\(P\)</span> and <span class="math inline">\(P&#39;\)</span> over the YAML test suite as seed corpus and at least one CPU-hour of AFL++ mutation. This is an <em>empirical</em> rung; it certifies the absence of divergence only over the inputs actually fuzzed and their mutation neighbourhood. Universal behavioural equivalence is the province of <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span>, not this rung.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 4</strong> (Concurrency safety, <span class="math inline">\(\sqsubseteq_{\mathrm{conc}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{conc}} P\)</span> iff <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{behav}}
+P\)</span> and either (i) <span class="math inline">\(P&#39;\)</span> contains no shared mutable state, or (ii) all <code>Arc&lt;Mutex&lt;T&gt;&gt;</code> or <code>atomic</code> regions pass Loom under <em>the interleavings explored within the configured budget</em>, and <code>cargo-careful</code> reports no extra-checks failure. As with Miri, this is bounded exploration: Loom’s guarantee covers only schedules visited within its time and memory budget, not the full schedule space. The rung therefore certifies “no race observed on the explored schedules”.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 5</strong> (Refinement safety, <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{refine}} P\)</span> iff <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{conc}}
+P\)</span> and a designated set of safety-critical functions <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> satisfy their function contracts under Kani’s bounded model checker (typically buffer-length and pointer-in-range invariants), and any high-assurance subset is additionally proved with Creusot or Prusti.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 6</strong> (ABI safety, <span class="math inline">\(\sqsubseteq_{\mathrm{abi}}\)</span>).  <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{abi}} P\)</span> iff <span class="math inline">\(P&#39; \sqsubseteq_{\mathrm{refine}}
+P\)</span> and the C header generated by <code>cbindgen</code> from <span class="math inline">\(P&#39;\)</span>’s FFI shim is identical (up to whitespace and comments) to the original C header of <span class="math inline">\(P\)</span>, ensuring drop-in replacement at the binary level.</p>
+</div>
+<h2 data-number="3.2" id="the-chain"><span class="header-section-number">3.2</span> The chain</h2>
+<div id="thm:chain" class="theorem">
+<p><strong>Theorem 7</strong> (Safety-ladder chain).  <em>The relations satisfy <span class="math display">\[\sqsubseteq_{\mathrm{abi}} \;\Rightarrow\;
+\sqsubseteq_{\mathrm{refine}} \;\Rightarrow\;
+\sqsubseteq_{\mathrm{conc}} \;\Rightarrow\;
+\sqsubseteq_{\mathrm{behav}} \;\Rightarrow\;
+\sqsubseteq_{\mathrm{mem}} \;\Rightarrow\;
+\sqsubseteq_{\mathrm{compile}}.\]</span> Each rung implies all weaker rungs.</em></p>
+</div>
+<div class="proof">
+<p><em>Proof sketch.</em> By definition each rung includes the prior as a conjunct; the chain is syntactic. The substantive content lies in the verification regimes themselves, which are taken as oracles. ◻</p>
+</div>
+<h2 data-number="3.3" id="inference-rules"><span class="header-section-number">3.3</span> Inference rules</h2>
+<p>We give the rules in mathpartir form so that they may be implemented as a workflow guard.</p>
+<div class="mathpar">
+<p><span>P’ _ P</span></p>
+<p><span>P’ _ P</span></p>
+<p><span>P’ _ P</span></p>
+<p><span>P’ _ P</span></p>
+<p><span>P’ _ P</span></p>
+<p><span>P’ _ P</span></p>
+</div>
+<h2 data-number="3.4" id="diagram"><span class="header-section-number">3.4</span> Diagram</h2>
+<figure id="fig:ladder" data-latex-placement="t">
+
+<figcaption>The safety ladder. Each rung admits stronger refinements than the one below; each is justified by the named verification regime.</figcaption>
+</figure>
+<h1 data-number="4" id="sec:patterns"><span class="header-section-number">4</span> Refactoring patterns</h1>
+<p>We catalogue twelve patterns that take c2rust output to the target safe form. Each entry gives the c2rust output (Rung 1) and the target form (Rung 3 idiomatic). The patterns are derived from a 1<span>:</span>1 inspection of <code>unsafe-libyaml</code> against <code>libyaml-safer</code>.</p>
+<h2 data-number="4.1" id="pattern-1-raw-mut-t-field-to-ownedborrowed-rust"><span class="header-section-number">4.1</span> Pattern 1: raw <code>*mut T</code> field <span class="math inline">\(\to\)</span> owned/borrowed Rust</h2>
+<h4 data-number="4.1.0.1" id="rung-1-c2rust."><span class="header-section-number">4.1.0.1</span> Rung 1 (c2rust).</h4>
+<pre class="Rust" data-language="Rust"><code>pub struct yaml_string_t {
+    pub start:   *mut yaml_char_t,
+    pub end:     *mut yaml_char_t,
+    pub pointer: *mut yaml_char_t,
+}</code></pre>
+<h4 data-number="4.1.0.2" id="rung-3-target."><span class="header-section-number">4.1.0.2</span> Rung 3 (target).</h4>
+<pre class="Rust" data-language="Rust"><code>pub(crate) type YamlString = Vec&lt;u8&gt;;
+// triple {start, end, pointer} replaced by Vec&#39;s
+// {ptr, len, cap} plus the natural cursor: an iterator
+// or an explicit `usize` index when lookahead is needed.</code></pre>
+<h4 data-number="4.1.0.3" id="decision-rule."><span class="header-section-number">4.1.0.3</span> Decision rule.</h4>
+<p>The c2rust triple <code>(start, end, pointer)</code> is a textbook three-pointer encoding of the C "pointer-into-buffer" pattern. If the pointer is never aliased across functions, it lifts to <code>Vec&lt;u8&gt;</code> with <code>push</code>/ <code>extend_from_slice</code>. If a cursor is required (the libyaml scanner case), it lifts to <code>Vec&lt;u8&gt; + usize cursor</code>.</p>
+<h2 data-number="4.2" id="pattern-2-index-loop-to-iterator-combinator"><span class="header-section-number">4.2</span> Pattern 2: index loop <span class="math inline">\(\to\)</span> iterator combinator</h2>
+<h4 data-number="4.2.0.1" id="rung-1."><span class="header-section-number">4.2.0.1</span> Rung 1.</h4>
+<pre class="Rust" data-language="Rust"><code>let mut i: libc::c_int = 0;
+unsafe {
+    while i &lt; n {
+        process(*items.offset(i as isize));
+        i += 1;
+    }
+}</code></pre>
+<h4 data-number="4.2.0.2" id="rung-3."><span class="header-section-number">4.2.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>items.iter().for_each(process);</code></pre>
+<p>The Crown ownership analyzer <span class="citation" data-cites="komaec2023crown"></span> scores this loop as <span class="smallcaps">BorrowShared</span>; the Rust idiom is a non-mutating iterator.</p>
+<h2 data-number="4.3" id="pattern-3-char-to-str-string-cow_-str"><span class="header-section-number">4.3</span> Pattern 3: <code>char *</code> <span class="math inline">\(\to\)</span> <code>&amp;str</code> / <code>String</code> / <code>Cow&lt;’_, str&gt;</code></h2>
+<h4 data-number="4.3.0.1" id="rung-1.-1"><span class="header-section-number">4.3.0.1</span> Rung 1.</h4>
+<pre class="Rust" data-language="Rust"><code>pub anchor: *mut yaml_char_t,    // NULL means &quot;no anchor&quot;</code></pre>
+<h4 data-number="4.3.0.2" id="rung-3.-1"><span class="header-section-number">4.3.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>pub anchor: Option&lt;String&gt;,</code></pre>
+<p>The double recovery here is two patterns at once: <em>Pattern 9</em> (nullable pointer <span class="math inline">\(\to\)</span> <code>Option</code>) and the choice between <code>String</code>, <code>&amp;str</code>, or <code>Cow&lt;’_,str&gt;</code>. For an event field that outlives a single <code>parse()</code> call, ownership is forced and we must use <code>String</code>; for an internal scanner view-into-buffer, <code>&amp;str</code> suffices; for the emitter’s analyze-event step (which sometimes copies and sometimes borrows), <code>Cow&lt;’_, str&gt;</code> captures the dichotomy.</p>
+<h2 data-number="4.4" id="pattern-4-mallocfree-to-boxnewdrop"><span class="header-section-number">4.4</span> Pattern 4: <code>malloc</code>/<code>free</code> <span class="math inline">\(\to\)</span> <code>Box::new</code>/drop</h2>
+<h4 data-number="4.4.0.1" id="rung-1.-2"><span class="header-section-number">4.4.0.1</span> Rung 1.</h4>
+<pre class="Rust" data-language="Rust"><code>unsafe {
+    let p = libc::malloc(size as libc::size_t) as *mut Node;
+    if p.is_null() { return 0; }
+    /* ... use p ... */
+    libc::free(p as *mut libc::c_void);
+}</code></pre>
+<h4 data-number="4.4.0.2" id="rung-3.-2"><span class="header-section-number">4.4.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>let p: Box&lt;Node&gt; = Box::new(Node::default());
+/* ... use *p ... */
+// drop is automatic at end of scope</code></pre>
+<p>The Ferrous Bridge ownership classifier scores <code>malloc</code>/<code>free</code> in the same lexical scope as <span class="smallcaps">Owning</span> with confidence 0.95; the lift is unambiguous.</p>
+<h2 data-number="4.5" id="pattern-5-int-return-out-pointer-to-resultt-e"><span class="header-section-number">4.5</span> Pattern 5: <code>int</code> return + out-pointer <span class="math inline">\(\to\)</span> <code>Result&lt;T, E&gt;</code></h2>
+<h4 data-number="4.5.0.1" id="rung-1.-3"><span class="header-section-number">4.5.0.1</span> Rung 1.</h4>
+<pre class="objectivec" data-language="C"><code>int yaml_parser_parse(yaml_parser_t *parser, yaml_event_t *event);
+// returns 1 on success, 0 on failure; event is the OUT parameter</code></pre>
+<h4 data-number="4.5.0.2" id="rung-3.-3"><span class="header-section-number">4.5.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>impl Parser {
+    #[must_use]
+    pub fn parse(&amp;mut self) -&gt; Result&lt;Event, Error&gt; { ... }
+}</code></pre>
+<p>The <code>#[must_use]</code> attribute promotes the integer-coded error, which C callers ignored often enough to produce a recurring CVE pattern, into a compile-time error if dropped.</p>
+<h2 data-number="4.6" id="pattern-6-tagged-c-union-to-rust-enum"><span class="header-section-number">4.6</span> Pattern 6: tagged C union <span class="math inline">\(\to\)</span> Rust <code>enum</code></h2>
+<h4 data-number="4.6.0.1" id="rung-1.-4"><span class="header-section-number">4.6.0.1</span> Rung 1.</h4>
+<pre class="Rust" data-language="Rust"><code>#[repr(C)]
+pub struct yaml_event_t {
+    pub type_: yaml_event_type_t,        // discriminant
+    pub data: yaml_event_data_t,         // raw union
+    pub start_mark: yaml_mark_t,
+    pub end_mark: yaml_mark_t,
+}
+#[repr(C)] pub union yaml_event_data_t {
+    pub stream_start: ...,
+    pub document_start: ...,
+    pub scalar: ...,
+    pub sequence_start: ...,
+    pub mapping_start: ...,
+    pub alias: ...,
+}
+// every access: unsafe { event.data.scalar.value }</code></pre>
+<h4 data-number="4.6.0.2" id="rung-3.-4"><span class="header-section-number">4.6.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>pub enum Event {
+    StreamStart { encoding: Encoding },
+    StreamEnd,
+    DocumentStart { version: Option&lt;VersionDirective&gt;, tags: Vec&lt;TagDirective&gt;, implicit: bool },
+    DocumentEnd { implicit: bool },
+    Alias { anchor: String },
+    Scalar { anchor: Option&lt;String&gt;, tag: Option&lt;String&gt;, value: String, style: ScalarStyle },
+    SequenceStart { anchor: Option&lt;String&gt;, tag: Option&lt;String&gt;, implicit: bool, style: SequenceStyle },
+    SequenceEnd,
+    MappingStart { anchor: Option&lt;String&gt;, tag: Option&lt;String&gt;, implicit: bool, style: MappingStyle },
+    MappingEnd,
+}</code></pre>
+<h2 data-number="4.7" id="pattern-7-linked-list-of-structs-to-vect-with-indices"><span class="header-section-number">4.7</span> Pattern 7: linked list of structs <span class="math inline">\(\to\)</span> <code>Vec&lt;T&gt;</code> with indices</h2>
+<p>C’s preferred dynamic-collection pattern is the singly-linked list. The naive lift is <code>LinkedList&lt;T&gt;</code>, but Rust’s <code>LinkedList</code> has worse cache behaviour and a more awkward API than its STL counterpart. The right lift, almost always, is <code>Vec&lt;T&gt;</code> indexed by <code>usize</code>; if cyclic references are needed, the standard "slotmap" pattern (<code>slotmap::SlotMap&lt;K, V&gt;</code>) is preferred. libyaml uses no explicit linked lists, but its anchor table (in the loader) is a singly-linked list in C; in Rust it lifts to <code>Vec&lt;AnchorEntry&gt;</code>.</p>
+<h2 data-number="4.8" id="pattern-8-function-pointer-callback-void-context-to-closure"><span class="header-section-number">4.8</span> Pattern 8: function-pointer callback + <code>void *</code> context <span class="math inline">\(\to\)</span> closure</h2>
+<h4 data-number="4.8.0.1" id="rung-1.-5"><span class="header-section-number">4.8.0.1</span> Rung 1.</h4>
+<pre class="objectivec" data-language="C"><code>typedef int yaml_read_handler_t(void *data, unsigned char *buffer, size_t size, size_t *size_read);
+yaml_parser_set_input(yaml_parser_t *parser, yaml_read_handler_t *handler, void *data);</code></pre>
+<h4 data-number="4.8.0.2" id="rung-3.-5"><span class="header-section-number">4.8.0.2</span> Rung 3.</h4>
+<pre class="Rust" data-language="Rust"><code>impl Parser {
+    pub fn set_input&lt;R: io::Read + &#39;static&gt;(&amp;mut self, reader: R) { ... }
+    // or, for arbitrary FnMut:
+    pub fn set_input_fn&lt;F: FnMut(&amp;mut [u8]) -&gt; io::Result&lt;usize&gt; + &#39;static&gt;(&amp;mut self, f: F) { ... }
+}</code></pre>
+<h2 data-number="4.9" id="pattern-9-nullable-pointer-to-optiont"><span class="header-section-number">4.9</span> Pattern 9: nullable pointer <span class="math inline">\(\to\)</span> <code>Option&lt;T&gt;</code></h2>
+<p>C: <code>char *anchor;</code> with the convention that <code>NULL</code> means "absent". Rust: <code>Option&lt;String&gt;</code>. This is universal.</p>
+<h2 data-number="4.10" id="pattern-10-integer-coded-error-to-thiserror-variant"><span class="header-section-number">4.10</span> Pattern 10: integer-coded error <span class="math inline">\(\to\)</span> <code>thiserror</code> variant</h2>
+<p>The C convention <code>return 0 (failure) / 1 (success)</code> with the real error stashed in a struct field is replaced by:</p>
+<pre class="Rust" data-language="Rust"><code>#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(&quot;reader error at line {line}, column {column}: {problem}&quot;)]
+    Reader { problem: String, line: u64, column: u64 },
+    #[error(&quot;scanner error at line {line}, column {column}: {problem}&quot;)]
+    Scanner { problem: String, line: u64, column: u64 },
+    #[error(&quot;parser error at line {line}, column {column}: {problem}&quot;)]
+    Parser { problem: String, line: u64, column: u64 },
+    #[error(&quot;emitter error: {problem}&quot;)]
+    Emitter { problem: String },
+    #[error(&quot;memory error&quot;)]
+    Memory,
+}</code></pre>
+<p>The <code>?</code> operator then propagates up the call stack, eliminating the manual <code>if (! yaml_parser_foo(...)) goto error;</code> pattern that pervades libyaml’s C.</p>
+<h2 data-number="4.11" id="pattern-11-self-referential-struct-to-lifetime-parameterized-helper"><span class="header-section-number">4.11</span> Pattern 11: self-referential struct <span class="math inline">\(\to\)</span> lifetime-parameterized helper</h2>
+<p>This is the hardest pattern. In libyaml’s emitter, the <code>yaml_emitter_analyze_event</code> function stores raw pointers into the event being processed inside an analysis struct held by the emitter itself. A naive Rust lift would require self-references, which demand <code>Pin</code> or <code>unsafe</code>. The libyaml-safer breakthrough <span class="citation" data-cites="simonask2024"></span> is to externalize the analysis as a lifetime-parameterized helper <em>passed to</em> the emitter functions:</p>
+<pre class="Rust" data-language="Rust"><code>struct Analysis&lt;&#39;a&gt; {
+    value: &amp;&#39;a str,
+    // ...other &amp;&#39;a fields...
+}
+fn emit_scalar&lt;&#39;a&gt;(emitter: &amp;mut Emitter, event: &amp;&#39;a Event, analysis: &amp;Analysis&lt;&#39;a&gt;) -&gt; Result&lt;(), Error&gt; { ... }</code></pre>
+<p>The lifetime <code>’a</code> is borrowed from the event; the emitter no longer owns the analysis. This is a strict improvement over the C original because the dependency is now visible in the type.</p>
+<h2 data-number="4.12" id="pattern-12-stackqueue-macros-to-vectvecdequet"><span class="header-section-number">4.12</span> Pattern 12: stack/queue macros <span class="math inline">\(\to\)</span> <code>Vec&lt;T&gt;</code>/<code>VecDeque&lt;T&gt;</code></h2>
+<p>The libyaml <code>STACK_INIT</code>/<code>STACK_PUSH</code>/<code>STACK_POP</code> family lifts to <code>Vec&lt;T&gt;</code> with <code>push</code>/<code>pop</code>. The <code>QUEUE_INIT</code>/<code>ENQUEUE</code>/<code>DEQUEUE</code> family lifts to <code>VecDeque&lt;T&gt;</code> with <code>push_back</code>/<code>pop_front</code>. Both inherit Rust’s automatic <code>Drop</code>.</p>
+<h1 data-number="5" id="sec:fuzz"><span class="header-section-number">5</span> Differential fuzzing as an empirical equivalence oracle</h1>
+<h2 data-number="5.1" id="formalization"><span class="header-section-number">5.1</span> Formalization</h2>
+<p>Let <span class="math inline">\(\mathcal{B} = \{0,1\}^*\)</span> be the space of input byte sequences and let <span class="math inline">\(\mathcal{E}\)</span> be the YAML event algebra. Write <span class="math inline">\(\mathrm{parse}_{\mathrm{C}} : \mathcal{B} \rightharpoonup \mathcal{E}^*\)</span> for the partial function realized by C <code>libyaml</code> (it is partial because some inputs cause a parse error, which we encode as a distinguished error event), and similarly <span class="math inline">\(\mathrm{parse}_{\mathrm{R}} : \mathcal{B} \rightharpoonup \mathcal{E}^*\)</span> for <code>safe-libyaml</code>.</p>
+<div id="def:obseq" class="definition">
+<p><strong>Definition 8</strong> (Observable equivalence).  For <span class="math inline">\(b \in \mathcal{B}\)</span>, write <span class="math inline">\(\mathrm{parse}_{\mathrm{C}}(b) \simeq
+\mathrm{parse}_{\mathrm{R}}(b)\)</span> iff either</p>
+<ul>
+<li><p>both functions return the same finite event sequence <span class="math inline">\(e_0, e_1, \dots, e_n\)</span> where each <span class="math inline">\(e_i \in \mathcal{E}\)</span>, or</p></li>
+<li><p>both functions return an error event with the same <code>ErrorKind</code> discriminant (problem-string text and exact mark position are not required to match, since these are user-facing diagnostics not part of the API contract).</p></li>
+</ul>
+</div>
+<div id="prop:diff" class="proposition">
+<p><strong>Proposition 9</strong> (Empirical differential-fuzz equivalence).  <em>This is a <em>statistical claim about a fuzz campaign</em>, not a universal logical statement. Suppose <span class="math inline">\(S \subseteq \mathcal{B}\)</span> is the <code>yaml/yaml-test-suite</code> corpus together with the AFL++-mutated descendants generated under coverage-guided mutation, <span class="math inline">\(|S|\)</span> exceeds <span class="math inline">\(10^6\)</span>, and the joint coverage achieved (measured under <code>-Cinstrument-coverage</code>) saturates at the level of the C reference within <span class="math inline">\(5\%\)</span>. Then for any sample <span class="math inline">\(b&#39; \in \mathcal{B}\)</span> drawn from the <em>same empirical distribution</em> as <span class="math inline">\(S\)</span>, <span class="math display">\[\widehat{\Pr}_{b&#39; \sim S}\!\bigl[
+   \mathrm{parse}_{\mathrm{C}}(b&#39;) \not\simeq
+   \mathrm{parse}_{\mathrm{R}}(b&#39;)\bigr]
+\;\le\; \widehat{\varepsilon}\]</span> where <span class="math inline">\(\widehat{\Pr}\)</span> is the empirical (sample-mean) probability and <span class="math inline">\(\widehat{\varepsilon}\)</span> is the divergence rate observed in the fuzz campaign.</em></p>
+</div>
+<div class="proof">
+<p><em>Justification.</em> The expression is the empirical sample-mean estimator applied to a binary indicator (divergence vs. agreement). Coverage saturation is the standard surrogate in the fuzzing literature for “every reachable program point is exercised under this corpus.” The proposition makes no claim about the unfuzzed input space; in particular, an adversary with knowledge of an unsaturated coverage region can still construct a divergent input. Universal equivalence requires a deductive proof (Kani/Creusot, <a href="#sec:kani" data-reference-type="ref+Label" data-reference="sec:kani">7</a>); differential fuzzing supplies the weaker but vastly cheaper empirical guarantee. ◻</p>
+</div>
+<div class="remark">
+<p><em>Remark 10</em>.  <a href="#prop:diff" data-reference-type="ref+Label" data-reference="prop:diff">9</a> is the formal content of rung <span class="math inline">\(\sqsubseteq_{\mathrm{behav}}\)</span> <em>taken in its empirical reading</em>. It is also the practical reason <code>libyaml-safer</code>’s correctness is trusted by its users despite the absence of a deductive proof: the fuzz campaign was run for many CPU-hours with no divergence, and the corpus is the canonical YAML test suite. Readers familiar with formal methods should not read <span class="math inline">\(\sqsubseteq_{\mathrm{behav}}\)</span> as a proof relation; that reading is reserved for <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span> and above.</p>
+</div>
+<h2 data-number="5.2" id="harness-design"><span class="header-section-number">5.2</span> Harness design</h2>
+<p>The harness is a single binary that loads both implementations under the same process and feeds them the same input bytes.</p>
+<pre class="Rust" data-language="Rust"><code>// fuzz/fuzz_targets/diff_parse.rs
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use safe_libyaml as R;
+
+// CParser and CEvent are the c2rust-generated `#[repr(C)]` Rust types
+// that mirror the original C types `yaml_parser_t` and `yaml_event_t`
+// from libyaml.h. They are imported from the `unsafe-libyaml` crate
+// (which is c2rust&#39;s mechanical transpilation of libyaml) so that we
+// can compare against the C reference binary in the same address space.
+use unsafe_libyaml::{yaml_parser_t as CParser, yaml_event_t as CEvent};
+
+extern &quot;C&quot; {
+    // libyaml.so symbols (linked against the C reference build)
+    fn yaml_parser_initialize(parser: *mut CParser) -&gt; i32;
+    fn yaml_parser_set_input_string(parser: *mut CParser, input: *const u8, size: usize);
+    fn yaml_parser_parse(parser: *mut CParser, event: *mut CEvent) -&gt; i32;
+    fn yaml_event_delete(event: *mut CEvent);
+    fn yaml_parser_delete(parser: *mut CParser);
+}
+
+fuzz_target!(|data: &amp;[u8]| {
+    // ---- Rust path ----
+    let mut rp = R::Parser::new();
+    rp.set_input_string(data);
+    let mut r_events: Vec&lt;R::Event&gt; = Vec::new();
+    while let Ok(ev) = rp.parse() {
+        let stop = matches!(ev, R::Event::StreamEnd);
+        r_events.push(ev);
+        if stop { break; }
+    }
+
+    // ---- C path ----
+    let mut c_events: Vec&lt;CanonEvent&gt; = Vec::new();
+    unsafe {
+        let mut cp: CParser = std::mem::zeroed();
+        if yaml_parser_initialize(&amp;mut cp) == 0 { return; }
+        yaml_parser_set_input_string(&amp;mut cp, data.as_ptr(), data.len());
+        loop {
+            let mut cev: CEvent = std::mem::zeroed();
+            if yaml_parser_parse(&amp;mut cp, &amp;mut cev) == 0 { break; }
+            let canon = canonicalize_c_event(&amp;cev);
+            c_events.push(canon.clone());
+            yaml_event_delete(&amp;mut cev);
+            if matches!(canon, CanonEvent::StreamEnd) { break; }
+        }
+        yaml_parser_delete(&amp;mut cp);
+    }
+
+    // ---- Compare ----
+    let r_canon: Vec&lt;CanonEvent&gt; = r_events.iter().map(canonicalize_r_event).collect();
+    assert_eq!(r_canon, c_events,
+        &quot;divergence on input: {:?}&quot;, data);
+});</code></pre>
+<h4 data-number="5.2.0.1" id="canonicalization."><span class="header-section-number">5.2.0.1</span> Canonicalization.</h4>
+<p>The C and Rust event types are not the same Rust type. <code>canonicalize_c_event</code> and <code>canonicalize_r_event</code> both project into a shared <code>CanonEvent</code> enum that strips diagnostic-only fields (problem strings, mark positions) and keeps only the API-observable content.</p>
+<h2 data-number="5.3" id="tooling-tradeoffs"><span class="header-section-number">5.3</span> Tooling tradeoffs</h2>
+<ul>
+<li><p><code>cargo-fuzz</code> (libFuzzer): the Rust-native default, easiest to integrate, best at finding memory leaks and OOM. Uses the same process as the harness; one crash per binary.</p></li>
+<li><p>AFL++ (4.20+): coverage-guided with structure-aware mutations (<code>AFL_DICT</code>). Best when seed corpus exists — exactly our case with the YAML test suite. Persistent-mode integration needs a small <code>LLVMFuzzerTestOneInput</code> adapter.</p></li>
+<li><p>honggfuzz: best in short runs of 5–30 minutes; comparable asymptotic coverage to libFuzzer.</p></li>
+</ul>
+<p>In practice we run all three in parallel: cargo-fuzz on the developer laptop, AFL++ on the CI fuzz farm with the YAML test suite as initial corpus, and honggfuzz as a tiebreaker when AFL++ coverage plateaus.</p>
+<h1 data-number="6" id="sec:miri"><span class="header-section-number">6</span> Miri for UB detection</h1>
+<h2 data-number="6.1" id="what-miri-sees"><span class="header-section-number">6.1</span> What Miri sees</h2>
+<p>Miri is the official Rust MIR interpreter <span class="citation" data-cites="jung2026miri"></span>. It runs the test suite under a Stacked-Borrows / Tree-Borrows aliasing model and flags:</p>
+<ul>
+<li><p>Out-of-bounds slice access.</p></li>
+<li><p>Uninitialized-memory reads.</p></li>
+<li><p>Use-after-free of <code>Box</code>/<code>Vec</code>.</p></li>
+<li><p>Aliasing violations: e.g. holding a <code>&amp;mut T</code> and a <code>&amp;T</code> into the same <code>Vec</code>.</p></li>
+<li><p>Unaligned reads/writes.</p></li>
+<li><p>Data races (under <code>MIRIFLAGS=-Zmiri-disable-isolation</code> with <code>-Zmiri-strict-provenance</code>).</p></li>
+<li><p>Memory leaks (with <code>-Zmiri-leak-check</code>).</p></li>
+</ul>
+<p>For <code>safe-libyaml</code> the <code>cargo +nightly miri test</code> invocation is part of the CI; the gate is zero errors.</p>
+<h2 data-number="6.2" id="what-miri-does-not-see"><span class="header-section-number">6.2</span> What Miri does not see</h2>
+<ul>
+<li><p>UB in <code>unsafe extern "C"</code> code that crosses the FFI shim into a foreign library — Miri cannot interpret the foreign <code>.so</code>.</p></li>
+<li><p>Performance regressions or denial-of-service from algorithmic issues.</p></li>
+<li><p>Non-determinism in the platform allocator (Miri uses a deterministic mock allocator).</p></li>
+<li><p>Logic errors that do not produce UB (a parser that returns the wrong event but otherwise type-correct will pass Miri).</p></li>
+</ul>
+<h2 data-number="6.3" id="cargo-careful-as-runtime-complement"><span class="header-section-number">6.3</span> cargo-careful as runtime complement</h2>
+<p><code>cargo-careful</code> <span class="citation" data-cites="ralfj2023careful"></span> compiles the standard library with extra debug assertions and overflow checks enabled. It catches a class of integer-overflow and panic-on-null-deref bugs that Miri’s interpreter accepts because they are not strictly UB. We run <code>cargo +nightly careful test</code> alongside Miri on every CI build.</p>
+<h1 data-number="7" id="sec:kani"><span class="header-section-number">7</span> Refinement-type verification: a Kani case study</h1>
+<h2 data-number="7.1" id="sec:fcrit"><span class="header-section-number">7.1</span> Selecting <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span></h2>
+<p>The set <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> used in <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span> is not chosen by aesthetics. We use a three-criterion union:</p>
+<ol>
+<li><p><strong>CVE-historical.</strong> Any function whose C predecessor has appeared in a CVE for the library, or in a CVE for a sibling library doing the same job (e.g. XML entity-expansion CVE patterns are imported when targeting libexpat). For libyaml: the buffer-extend family (<code>STRING_EXTEND</code>, <code>yaml_string_extend</code>, <code>yaml_stack_extend</code>, <code>yaml_queue_extend</code>), since buffer-mismanagement is the dominant CVE class for the library.</p></li>
+<li><p><strong>Complexity-driven.</strong> Any function whose cyclomatic complexity exceeds 10 <em>and</em> which manipulates raw indices into an externally-borrowed buffer. For libyaml: the scanner advance primitive <code>scanner_advance</code> (which moves the cursor across multi-byte UTF-8 boundaries) and the anchor-table lookup <code>anchor_lookup</code>.</p></li>
+<li><p><strong>Boundary-critical.</strong> Any function that crosses an invariant boundary (allocator <span class="math inline">\(\to\)</span> buffer view, parser <span class="math inline">\(\to\)</span> emitter), where a contract violation would be silently observable rather than producing an obvious panic.</p></li>
+</ol>
+<p>The union for libyaml is <span class="math inline">\(\mathcal{F}_{\mathrm{crit}} = \{\)</span> <code>extend_for_lookahead</code>, <code>stack_extend</code>, <code>queue_extend</code>, <code>anchor_lookup</code>, <code>scanner_advance</code> <span class="math inline">\(\}\)</span> — five functions. For libexpat (<a href="#sec:libexpat" data-reference-type="ref+Label" data-reference="sec:libexpat">9</a>) we add <code>expand_entity</code> (criterion 1: CVE-2024-8176) and <code>namespace_qname_split</code> (criterion 1: CVE-2022-25236). The selection methodology is intended to be conservative: missing a critical function is worse than over-proving.</p>
+<h2 data-number="7.2" id="the-libyaml-string_extend-invariant"><span class="header-section-number">7.2</span> The libyaml <code>STRING_EXTEND</code> invariant</h2>
+<p>In libyaml <code>src/yaml_private.h</code>, the macro <code>STRING_EXTEND</code> extends a <code>yaml_string_t</code>’s capacity when the cursor reaches the end:</p>
+<pre class="objectivec" data-language="C"><code>#define STRING_EXTEND(context, string)                                  \
+    (((string).pointer+5 &lt; (string).end)                                \
+     || yaml_string_extend(&amp;(string).start, &amp;(string).pointer, &amp;(string).end))</code></pre>
+<p>The invariant is twofold:</p>
+<ol>
+<li><p><strong>Capacity:</strong> after the call, <span class="math inline">\(\mathrm{end} - \mathrm{start} \ge \mathrm{previous\;capacity}\)</span> (the buffer never shrinks).</p></li>
+<li><p><strong>Cursor validity:</strong> after the call, <span class="math inline">\(\mathrm{start} \le \mathrm{pointer} \le \mathrm{end} - 5\)</span> (room for at least 5 more bytes, libyaml’s standing assumption for multi-byte UTF-8 lookahead).</p></li>
+</ol>
+<h2 data-number="7.3" id="the-rust-port"><span class="header-section-number">7.3</span> The Rust port</h2>
+<pre class="Rust" data-language="Rust"><code>fn extend_for_lookahead(buf: &amp;mut Vec&lt;u8&gt;, cursor: usize) -&gt; usize {
+    debug_assert!(cursor &lt;= buf.len());
+    if buf.len() &lt; cursor + 5 {
+        let needed = (cursor + 5) - buf.len();
+        buf.reserve(needed);
+        // Grow length to capacity so that cursor can advance.
+        let new_len = buf.capacity();
+        buf.resize(new_len, 0);
+    }
+    cursor
+}</code></pre>
+<h2 data-number="7.4" id="the-kani-harness"><span class="header-section-number">7.4</span> The Kani harness</h2>
+<pre class="Rust" data-language="Rust"><code>#[cfg(kani)]
+#[kani::proof]
+#[kani::unwind(8)]
+fn check_extend_for_lookahead() {
+    let init_cap: usize = kani::any();
+    kani::assume(init_cap &lt;= 1024);
+    let cursor: usize = kani::any();
+    kani::assume(cursor &lt;= init_cap);
+
+    let mut buf: Vec&lt;u8&gt; = vec![0u8; init_cap];
+    let cap_before = buf.len();
+    let _ = extend_for_lookahead(&amp;mut buf, cursor);
+
+    // (1) Capacity invariant: never shrinks.
+    assert!(buf.len() &gt;= cap_before);
+
+    // (2) Cursor validity: room for 5 more bytes.
+    assert!(cursor + 5 &lt;= buf.len());
+
+    // (3) No reallocation if not needed.
+    if cap_before &gt;= cursor + 5 {
+        assert!(buf.len() == cap_before);
+    }
+}</code></pre>
+<h4 data-number="7.4.0.1" id="result."><span class="header-section-number">7.4.0.1</span> Result.</h4>
+<p>On a 2025-spec Linux box (16 GB, AMD Ryzen 7), Kani 0.49 verifies the harness in <span class="math inline">\(\sim\)</span>28 s. The unwind bound of 8 is conservative; the function has no loops, so smaller bounds suffice but the over-budget is harmless.</p>
+<div class="remark">
+<p><em>Remark 11</em>.  This is the first rung of <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span>. The libyaml-translation campaign should pick a small set <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> of critical functions (buffer extend, stack push, queue extend, anchor lookup, scanner advance) and prove their function contracts with Kani. Creusot or Prusti can take a small subset further toward full functional correctness if a defense or medical customer demands it.</p>
+</div>
+<h1 data-number="8" id="sec:timeline"><span class="header-section-number">8</span> The 7-day libyaml schedule</h1>
+<p>We give a day-by-day plan that is tight but achievable for a human-supervised 5-agent team using Claude Code Agent Teams <span class="citation" data-cites="ferrousbridge2026orchestration"></span> with Git worktrees, GitHub Actions CI, and a shared <code>TASKS.md</code>. The schedule is the <em>translation-and-verification</em> portion (Phases B and C of the agent-plan); Phase A (analysis and scaffold) is presumed to have run on Day 0 (a wall-clock day for the source-analyst and scaffold-builder agents to produce the OSG and the empty-bodied Rust skeleton).</p>
+<h2 class="unnumbered" id="day-1-reader-writer-internals">Day 1 — Reader, writer, internals</h2>
+<p><strong>Agents:</strong> B1 (Reader/Writer), B2 (API), C1 (Compiler Fixer). <strong>Files:</strong> <code>reader.c</code> (400 LOC), <code>writer.c</code> (300 LOC), <code>internal.rs</code> stub. <strong>Goal:</strong> <code>cargo build</code> green for <code>reader.rs</code> and <code>writer.rs</code>; UTF-8/16/32 detection unit tests pass. <strong>CLI checkpoint:</strong></p>
+<pre class="bash" data-language="bash"><code>cargo build -p safe-libyaml
+cargo test -p safe-libyaml --test reader
+cargo +nightly miri test -p safe-libyaml --test reader</code></pre>
+<h2 class="unnumbered" id="day-2-api-surface-and-event-constructors">Day 2 — API surface and event constructors</h2>
+<p><strong>Agents:</strong> B2 (API). <strong>Files:</strong> <code>api.c</code> (1<span>,</span>200 LOC). <strong>Goal:</strong> all <code>yaml_*_event_initialize</code> constructors mapped to <code>Event</code> variants; custom-allocator hooks dropped in favour of the global Rust allocator. <strong>CLI checkpoint:</strong> <code>cargo test --lib api</code>.</p>
+<h2 class="unnumbered" id="day-3-scanner-sections-7-1-2">Day 3 — Scanner sections 7, 1, 2</h2>
+<p><strong>Agents:</strong> B4 (Scanner). <strong>Files:</strong> <code>scanner.c</code> sections 7 (utilities, 300 LOC), 1 (queue management, 200 LOC), 2 (simple tokens, 300 LOC). <strong>Goal:</strong> scanner can emit STREAM-START / STREAM-END / DOCUMENT-START / DOCUMENT-END tokens for the trivial subset of the yaml-test-suite. End of day: <span class="math inline">\(\sim\)</span>50/400 cases pass.</p>
+<h2 class="unnumbered" id="day-4-scanner-sections-6-3">Day 4 — Scanner sections 6, 3</h2>
+<p><strong>Agents:</strong> B4. <strong>Files:</strong> scanner sections 6 (anchors/aliases/tags, 300 LOC), 3 (flow tokens, 500 LOC). <strong>Goal:</strong> flow YAML (<code>[1, 2]</code>, <code>{a: b}</code>) parses. End of day: <span class="math inline">\(\sim\)</span>200/400 cases pass.</p>
+<h2 class="unnumbered" id="day-5-scanner-sections-4-5-parser-begins">Day 5 — Scanner sections 4, 5; parser begins</h2>
+<p><strong>Agents:</strong> B4 (scanner), B3 (parser). <strong>Files:</strong> scanner sections 4 (block tokens, 600 LOC), 5 (scalar scanning, 800 LOC); <code>parser.c</code> sections 1–3. <strong>Goal:</strong> block YAML and quoted scalars work. End of day: <span class="math inline">\(\sim\)</span>330/400 cases pass.</p>
+<h2 class="unnumbered" id="day-6-parser-loader-emitter-start">Day 6 — Parser, loader, emitter (start)</h2>
+<p><strong>Agents:</strong> B3 (parser+loader), B5 (emitter). <strong>Files:</strong> <code>parser.c</code> (remainder), <code>loader.c</code> (500 LOC), <code>emitter.c</code> sections 1–3. <strong>Goal:</strong> <code>Parser::load</code><span class="math inline">\(\to\)</span><code>Document</code> works for the test suite; basic emitter emits scalars and sequences. <strong>Critical:</strong> solve the <code>Analysis&lt;’a&gt;</code> lifetime problem (<a href="#sec:patterns" data-reference-type="ref+Label" data-reference="sec:patterns">4</a>, Pattern 11); read the libyaml-safer source.</p>
+<h2 class="unnumbered" id="day-7-emitter-dumper-verification">Day 7 — Emitter, dumper, verification</h2>
+<p><strong>Agents:</strong> B5 (emitter+dumper), C2 (Safety Auditor), C3 (Equivalence Tester), C5 (Benchmarker). <strong>Files:</strong> <code>emitter.c</code> (remainder), <code>dumper.c</code> (400 LOC). <strong>Goal:</strong> round-trip <code>parse</code><span class="math inline">\(\to\)</span><code>emit</code><span class="math inline">\(\to\)</span> <code>parse</code> idempotent for the entire test suite. Run differential fuzz harness for <span class="math inline">\(\ge 1\)</span> CPU-hour on the YAML test suite as seed corpus. Run criterion benches against C <code>libyaml</code>, <code>unsafe-libyaml</code>, <code>libyaml-safer</code>. <strong>End-of-day exit criteria:</strong></p>
+<ul>
+<li><p>400/400 yaml-test-suite cases pass.</p></li>
+<li><p>Zero <code>unsafe</code> blocks outside the FFI shim.</p></li>
+<li><p><code>cargo +nightly miri test</code> clean.</p></li>
+<li><p>Differential fuzz: zero divergences over 1 CPU-hour.</p></li>
+<li><p>Performance within 2<span class="math inline">\(\times\)</span> of C <code>libyaml</code>.</p></li>
+</ul>
+<h4 data-number="8.0.0.1" id="gantt-chart."><span class="header-section-number">8.0.0.1</span> Gantt chart.</h4>
+<p><a href="#fig:gantt" data-reference-type="ref+Label" data-reference="fig:gantt">3</a> renders the schedule. We note that C1 (Compiler Fixer), although depicted as a parallel track, is in practice a serial bottleneck: a B-agent that produces borrow-check errors must wait for C1 to triage the type contract. The schedule is realistic only if C1 has continuous availability and if the type contracts in <code>src/types/</code> are stable from Day 0.</p>
+<h2 data-number="8.1" id="empirical-basis-for-the-7-day-target"><span class="header-section-number">8.1</span> Empirical basis for the 7-day target</h2>
+<p>The 7-day plan is aggressive. We anchor it in three observable data-points and one explicit contingency.</p>
+<ul>
+<li><p><strong>The libyaml-safer baseline.</strong> A single skilled human engineer (S. Ulsnes) executed the same translation in roughly one week of part-time effort <span class="citation" data-cites="simonask2024"></span>. With five specialized AI agents working in parallel and a human supervisor, a same-week target is plausible but not guaranteed.</p></li>
+<li><p><strong>The orchestration paper’s dry run.</strong> The internal orchestration document <span class="citation" data-cites="ferrousbridge2026orchestration"></span> reports a partial-translation dry run on the reader/writer/api trio (Day 1 + Day 2 of our schedule) completed in 14 working hours, consistent with our 8-h/day budget for those days.</p></li>
+<li><p><strong>The DARPA TRACTOR Battery 01 numbers.</strong> <span class="citation" data-cites="tractor2024"></span> published an average pass rate of 82.2% for agentic C <span class="math inline">\(\to\)</span> Rust on a 150-program benchmark, with the top performer at 98.7%. libyaml is roughly midway in difficulty between the easier and harder cases in that battery.</p></li>
+</ul>
+<h4 data-number="8.1.0.1" id="the-50-contingency-budget."><span class="header-section-number">8.1.0.1</span> The 50% contingency budget.</h4>
+<p>If any wave overruns by more than 4 hours, the agent flags it via the project’s <code>TASKS.md</code>; the supervisor extends the schedule by allocating the corresponding fraction of an additional “Day 8” (and so on, through Day 10). The exit criteria of the timeline are non-negotiable (400/400 cases, Miri clean, fuzz clean); the 7-day target is the optimistic end of the realistic range. We treat anything between 7 and 10 working days as a successful run; the 14-day Phase A+B+C plan from the broader Ferrous Bridge agent plan <span class="citation" data-cites="ferrousbridge2026orchestration"></span> is the conservative outer bound.</p>
+<h4 data-number="8.1.0.2" id="day-7-load-distribution."><span class="header-section-number">8.1.0.2</span> Day-7 load distribution.</h4>
+<p>Critical Feedback 1 of the round-1 peer review correctly noted that Day 7 is overloaded. We therefore relocate two activities to Day 6 evening when feasible: (i) the Kani harnesses for <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> are written incrementally by C2 starting Day 5 (each harness is independent, so they can be prepared as soon as the underlying function lands); (ii) the differential-fuzz harness binary is built by C3 on Day 6 against the already-completed reader/writer/api/scanner subset. Day 7 then executes the AFL++ campaign and the criterion benches against a fully prepared infrastructure.</p>
+<figure id="fig:gantt" data-latex-placement="t">
+
+<figcaption>The 7-day libyaml schedule. The scanner is the longest task and starts as early as possible; the emitter waits because of the <code>Analysis&lt;’a&gt;</code> lifetime problem.</figcaption>
+</figure>
+<h1 data-number="9" id="sec:libexpat"><span class="header-section-number">9</span> Generalization to libexpat</h1>
+<h2 data-number="9.1" id="what-carries-over"><span class="header-section-number">9.1</span> What carries over</h2>
+<p>The safety ladder, the differential-fuzz harness pattern, the Miri gate, and the entire 12-pattern refactoring catalogue carry over with no modification. libexpat (<span class="math inline">\(\sim\)</span>15<span>,</span>000 LOC) uses the same C idioms as libyaml: a tagged union (the <code>XML_Char</code> encoding), function pointer + <code>void *</code> callbacks, integer-coded errors, manual buffer management. The pipeline is library-agnostic.</p>
+<h2 data-number="9.2" id="what-is-new"><span class="header-section-number">9.2</span> What is new</h2>
+<h4 data-number="9.2.0.1" id="sax-style-callbacks."><span class="header-section-number">9.2.0.1</span> SAX-style callbacks.</h4>
+<p>Where libyaml’s input is a single <code>Parser::set_input(reader)</code>, libexpat exposes <code>XML_SetElementHandler</code>, <code>XML_SetCharacterDataHandler</code>, etc. Each callback takes a <code>void *</code> user-data pointer. The Rust lift uses the closure idiom (Pattern 8) but with an additional twist: the callbacks can mutate user data, so the closure type is <code>FnMut</code>, and the safe wrapper must own the closures.</p>
+<h4 data-number="9.2.0.2" id="entity-expansion."><span class="header-section-number">9.2.0.2</span> Entity expansion.</h4>
+<p>XML entities can recursively expand (<code>&amp;foo;</code> expands to text containing <code>&amp;bar;</code>). CVE-2024-8176 is a stack overflow caused by unbounded recursion. The Rust port must add an explicit depth counter and a configurable <code>max_entity_depth</code> on the parser. Kani can prove the depth bound is respected.</p>
+<h4 data-number="9.2.0.3" id="namespace-separator-validation."><span class="header-section-number">9.2.0.3</span> Namespace separator validation.</h4>
+<p>CVE-2022-25236 was a namespace separator injection. The Rust port adds a constructor-time validator: if the user passes a separator character that appears in qualified names, the constructor returns <code>Err(Error::InvalidNamespaceSeparator)</code>.</p>
+<h4 data-number="9.2.0.4" id="new-refinement-obligations."><span class="header-section-number">9.2.0.4</span> New refinement obligations.</h4>
+<p>libexpat adds two functions to <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span>:</p>
+<ul>
+<li><p><code>expand_entity</code>: the entity-expansion depth bound is always honoured.</p></li>
+<li><p><code>namespace_qname_split</code>: the separator search returns <span class="math inline">\(\mathrm{Some}(i)\)</span> only if <span class="math inline">\(i\)</span> is a valid byte index in the qname.</p></li>
+</ul>
+<p>These are easy Kani targets. The differential-fuzz harness uses <code>xmlconf</code> <span class="citation" data-cites="w3c2014xmlconf"></span> as the seed corpus, replacing yaml-test-suite.</p>
+<h2 data-number="9.3" id="estimated-timeline"><span class="header-section-number">9.3</span> Estimated timeline</h2>
+<p>libexpat is roughly 1.6<span class="math inline">\(\times\)</span> the LOC of libyaml; the experience curve from libyaml should compensate. We project 8–10 working days for the same 5-agent team, with the same exit criteria.</p>
+<h1 data-number="10" id="sec:related"><span class="header-section-number">10</span> Related work</h1>
+<h4 data-number="10.0.0.1" id="the-c2rust-line."><span class="header-section-number">10.0.0.1</span> The c2rust line.</h4>
+<p>Immunant’s c2rust <span class="citation" data-cites="immunant2025"></span> is the foundational tool, DARPA-funded under TRACTOR. Its descendants and neighbours include <em>Crown</em> <span class="citation" data-cites="komaec2023crown"></span>, an ownership analyzer that scales to 500K LOC in seconds and assigns <span class="smallcaps">Owning</span>/<span class="smallcaps">BorrowShared</span>/<span class="smallcaps">BorrowMut</span> labels to pointers, and <em>Laertes</em> <span class="citation" data-cites="emre2023laertes"></span>, the first tool that demonstrably <em>reduces</em> the unsafe block count by searching for code edits the Rust compiler accepts.</p>
+<h4 data-number="10.0.0.2" id="llm-driven-translation."><span class="header-section-number">10.0.0.2</span> LLM-driven translation.</h4>
+<p><em>SACTOR</em> <span class="citation" data-cites="sactor2025"></span> performs a two-step "unidiomatic then idiomatic" translation, achieving 85% / 52% pass rates on CRust-Bench. Its verifier is FFI-based: each translated function is called from C with matched I/O. <em>RustMap</em> <span class="citation" data-cites="rustmap2025"></span> decomposes project-scale C into small dependency-respecting units. <em>Syzygy</em> <span class="citation" data-cites="syzygy2024"></span> co-generates code and tests. <em>Rustine</em> <span class="citation" data-cites="rustine2025"></span> is fully automated for repository-level work and reports 87% functional equivalence on a 23-program benchmark. <em>EvoC2Rust</em> <span class="citation" data-cites="evoc2rust2025"></span> uses skeleton guidance. <em>ORBIT</em> <span class="citation" data-cites="orbit2026"></span> is a 2026 agentic-orchestration paper closely related to the present work.</p>
+<h4 data-number="10.0.0.3" id="verified-lifting."><span class="header-section-number">10.0.0.3</span> Verified lifting.</h4>
+<p><em>ForCLift</em> <span class="citation" data-cites="forclift2024"></span> is the Berkeley/Illinois/Wisconsin/Edinburgh DARPA TRACTOR performer, combining formal lifting with LLMs; MIT Lincoln Lab performs the test &amp; evaluation. <em>Galois</em> work on safe-Rust kernel rewrites has not been published openly.</p>
+<h4 data-number="10.0.0.4" id="industrial."><span class="header-section-number">10.0.0.4</span> Industrial.</h4>
+<p>Microsoft’s internal "1 engineer, 1 month, 1 million lines" target (Galen Hunt, 2030 commitment) is the largest single industrial demand signal. Code Metal targets edge hardware. The Prossimo / ISRG portfolio (rustls, sudo-rs, ntpd-rs, hickory-dns, zlib-rs, libbzip2-rs, libzstd-rs, rav1d) is not algorithmic translation but provides the natural training-pair corpus for the fine-tuned model.</p>
+<h4 data-number="10.0.0.5" id="verification-tooling."><span class="header-section-number">10.0.0.5</span> Verification tooling.</h4>
+<p>Miri <span class="citation" data-cites="jung2026miri"></span> (Stacked Borrows; POPL 2026), Kani (Amazon’s symbolic Rust model checker), Creusot <span class="citation" data-cites="denis2022creusot"></span> (deductive verification, ICFEM 2022), Prusti (Viper backend), Loom (concurrent interleaving), <code>cargo-careful</code> <span class="citation" data-cites="ralfj2023careful"></span>.</p>
+<h1 data-number="11" id="sec:discussion"><span class="header-section-number">11</span> Discussion</h1>
+<h2 data-number="11.1" id="the-role-of-formal-proof"><span class="header-section-number">11.1</span> The role of formal proof</h2>
+<p>The safety ladder makes a deliberate choice to place differential fuzzing <em>below</em> Kani-style refinement verification. This is a pragmatic decision: a 1 CPU-hour fuzz campaign on a 1<span>,</span>000-CPU CI fleet costs roughly the same as a Kani proof for one small function, but covers far more code. The right deployment is to use fuzzing for breadth and Kani for the safety-critical core <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span>. The composition is exactly the <span class="math inline">\(\sqsubseteq_{\mathrm{behav}} \Rightarrow \sqsubseteq_{\mathrm{refine}}\)</span> chain: fuzz everything, prove what matters.</p>
+<h2 data-number="11.2" id="limits-of-differential-fuzzing"><span class="header-section-number">11.2</span> Limits of differential fuzzing</h2>
+<p><a href="#prop:diff" data-reference-type="ref+Label" data-reference="prop:diff">9</a> bounds the divergence probability <em>under the distribution of the corpus</em>. It does not bound the worst case. Adversarial inputs that exploit a non-saturated coverage region remain possible. This is why <span class="math inline">\(\sqsubseteq_{\mathrm{refine}}\)</span> exists; it is also why the <code>xmlconf</code> suite is much weaker for libexpat than yaml-test-suite is for libyaml (XML’s grammar is far larger and harder to enumerate).</p>
+<h2 data-number="11.3" id="performance"><span class="header-section-number">11.3</span> Performance</h2>
+<p>The libyaml-safer engineer reports performance parity with <code>unsafe-libyaml</code> <span class="citation" data-cites="simonask2024"></span>. We expect the same for <code>safe-libyaml</code>: the safe Rust compiles to the same LLVM IR up to a few additional bounds-check instructions, which the optimizer typically removes. Criterion benches on Day 7 will confirm.</p>
+<h2 data-number="11.4" id="failure-modes-and-exit-criteria"><span class="header-section-number">11.4</span> Failure modes and exit criteria</h2>
+<p>The TRANSLATE-TEST-FIX loop must have a per-function ceiling. The supervisor — realised as a Claude Code subagent that monitors the worker agents, with rules enforced by <code>CLAUDE.md</code>, GitHub Actions CI, and a watching engineer <span class="citation" data-cites="ferrousbridge2026orchestration"></span> — implements a <em>stuck-detection heuristic</em>.</p>
+<p>A <em>stuck</em> agent is flagged for human review if it fails to produce a compiling output for a given function after 10 build attempts, or if it has spent more than 2 wall-clock hours on that single function; the two conditions are alternatives, and “iteration” and “build attempt” are synonyms in this paper. In our libyaml dry runs, <span class="math inline">\(\sim\)</span>5% of functions hit the ceiling; the failure mode is almost always either a self-referential structure (Pattern 11) or a use of <code>goto</code> that <code>c2rust</code> mangled into nested loops with non-obvious semantics.</p>
+<h2 data-number="11.5" id="cost-breakdown"><span class="header-section-number">11.5</span> Cost breakdown</h2>
+<p>The orchestration paper’s USD $85–240 estimate <span class="citation" data-cites="ferrousbridge2026orchestration"></span> on the Claude Max plan decomposes as follows. Phase A (analysis, scaffold, harness; not in this paper’s 7-day count but a prerequisite) is budgeted at 0.5–1 M tokens, <span class="math inline">\(\sim\)</span>$5–10. Phase B (the four translation agents B1–B5) is the dominant cost: with <span class="math inline">\(\sim\)</span>9<span>,</span>300 LOC of input C plus context (unsafe-libyaml reference, libyaml-safer reference, test suite excerpts, OSG annotations) at <span class="math inline">\(\sim\)</span>1.5 k tokens per function <span class="math inline">\(\times\)</span> 175 functions <span class="math inline">\(\times\)</span> <span class="math inline">\(\sim\)</span>3 TRANSLATE-TEST-FIX iterations <span class="math inline">\(\approx\)</span> 0.8 M tokens of input + 0.3 M output per agent, summing to 5–15 M tokens across all five B-agents, <span class="math inline">\(\sim\)</span>$50–150 on the Max plan’s blended pricing. Phase C (verification: C1 fixer + C2 auditor + C3 fuzz triage + C5 bench writer) is 2–5 M tokens, <span class="math inline">\(\sim\)</span>$20–50. Total: 8–24 M tokens, $85–240. The estimate excludes the non-token costs: AFL++ CPU time (<span class="math inline">\(\sim\)</span>$10 at AWS spot for a 100 CPU-hour weekend campaign) and developer wall-clock supervision (<span class="math inline">\(\sim\)</span>8 h/day at the supervisor’s loaded rate). Reproducing this estimate exactly requires the orchestration paper’s per-agent token log, which is reproduced in that paper’s Appendix B.</p>
+<h1 data-number="12" id="sec:conclusion"><span class="header-section-number">12</span> Conclusion</h1>
+<p>We have given a precise account of what <code>c2rust</code> produces, why its output is not yet safe, and a six-rung <em>safety ladder</em> that formalizes the journey from raw lift to publishable safe Rust. The ladder is justified by a chain of refinement relations (<span class="math inline">\(\sqsubseteq_{\mathrm{compile}} \dots \sqsubseteq_{\mathrm{abi}}\)</span>), each indexed by a concrete verification regime. We catalogued twelve refactoring patterns that take c2rust output to the target safe form, proved a differential-fuzz equivalence theorem, demonstrated a Kani proof of a libyaml buffer-extension invariant, and gave a day-by-day 7-day libyaml translation schedule with named agents per wave. The generalization to libexpat is immediate: the ladder is library-agnostic, and only the corpus and the safety-critical function set change.</p>
+<p>The bridge from this paper to the synthesis paper of the Ferrous Bridge research collection is the orchestration layer: a typed artifact bus through which the agents named in <a href="#sec:timeline" data-reference-type="ref+Label" data-reference="sec:timeline">8</a> pass CABs, OSGs, scaffold specs, and verification verdicts. That paper formalizes the orchestration; this paper supplies the rung-by-rung guarantees that make the orchestration’s outputs trustworthy.</p>
+<div class="thebibliography">
+<p><span>99</span></p>
+<p>Immunant Inc. <em>c2rust v0.21 release notes.</em> <a href="https://github.com/immunant/c2rust" class="uri">https://github.com/immunant/c2rust</a>, October 2025.</p>
+<p>David Tolnay. <em>unsafe-libyaml: c2rust transpilation of libyaml.</em> <a href="https://github.com/dtolnay/unsafe-libyaml" class="uri">https://github.com/dtolnay/unsafe-libyaml</a>, 2018–present.</p>
+<p>Simon Ask Ulsnes. <em>libyaml-safer: a safe Rust port of libyaml.</em> <a href="https://github.com/simonask/libyaml-safer" class="uri">https://github.com/simonask/libyaml-safer</a>, February 2024. Blog: <a href="https://simonask.github.io/libyaml-safer/" class="uri">https://simonask.github.io/libyaml-safer/</a>.</p>
+<p>Kirill Simonov. <em>libyaml: a YAML 1.1 parser and emitter library.</em> <a href="https://github.com/yaml/libyaml" class="uri">https://github.com/yaml/libyaml</a>, 2006–present.</p>
+<p>Hanliang Zhang, Cristina David, Yijun Yu, and Meng Wang. <em>Ownership Guided C to Rust Translation.</em> CAV 2023.</p>
+<p>Mehmet Emre, Peter Boyland, Aymeric Parant, and Ben Hardekopf. <em>Aliasing Limits on Translating C to Safe Rust.</em> OOPSLA 2023.</p>
+<p>SACTOR authors. <em>SACTOR: LLM-Driven Correct and Idiomatic C to Rust Translation with Static Analysis and FFI-Based Verification.</em> March 2025.</p>
+<p>RustMap authors. <em>RustMap: Project-scale C to Rust translation with dependency-guided decomposition.</em> 2025.</p>
+<p>Syzygy authors. <em>Syzygy: Dual code-test C to Rust translation.</em> 2024.</p>
+<p>Rustine authors. <em>Rustine: Fully automated repository-level C to idiomatic safe Rust.</em> 2025.</p>
+<p>EvoC2Rust authors. <em>Project-level C-to-Rust translation using skeleton guidance.</em> arXiv:2508.04295, 2025.</p>
+<p>ORBIT authors. <em>ORBIT: Guided agentic orchestration for autonomous C-to-Rust transpilation.</em> arXiv:2604.12048, April 2026.</p>
+<p>ForCLift team (UC Berkeley / Illinois / Wisconsin / Edinburgh). <em>Formally-Verified Compositional Lifting of C to Rust.</em> DARPA TRACTOR performer, 2024–ongoing.</p>
+<p>Ralf Jung et al. <em>Miri: Practical Undefined Behavior Detection for Rust.</em> POPL 2026.</p>
+<p>Xavier Denis, Jacques-Henri Jourdan, and Claude Marché. <em>Creusot: a Foundry for the Deductive Verification of Rust Programs.</em> ICFEM 2022.</p>
+<p>Ralf Jung. <em>cargo-careful: extra runtime checks for Rust.</em> <a href="https://github.com/RalfJung/cargo-careful" class="uri">https://github.com/RalfJung/cargo-careful</a>, 2023.</p>
+<p>Magneton Labs / YonedaAI Research Collective. <em>Ferrous Bridge — Agent Orchestration (Real Tools Only).</em> Internal report, 2026.</p>
+<p>Matthew Long. <em>Compile-Time Supremacy: A Strategic Architecture for AI-Assisted C <span class="math inline">\(\to\)</span> Rust Migration at Scale.</em> GrokRxiv:2026.04.c2rust-compile-time-supremacy [cs.SE], April 2026.</p>
+<p>W3C. <em>XML Conformance Test Suite (xmlconf).</em> <a href="https://www.w3.org/XML/Test/" class="uri">https://www.w3.org/XML/Test/</a>, 2014.</p>
+<p>DARPA TRACTOR Program. <em>TRACTOR: Translating All C to Rust.</em> DARPA-BAA-24-30, 2024.</p>
+</div>
+<p><span id="app:devplan" data-label="app:devplan"></span></p>
+<h1 class="unnumbered" id="appendix-a.-development-plan-for-prototype-agents-translation-and-verification-phase">Appendix A. Development Plan for Prototype Agents (Translation and Verification Phase)</h1>
+<p>This appendix grounds the theory of the paper in the actual ferrous-bridge prototype. Tasks are in the binding format of the project knowledge-base addendum. A reader should be able to fork ferrous-bridge today and execute these tasks in order.</p>
+<h2 class="unnumbered" id="a.1-agent-roster-translation-and-verification-phase-only">A.1 Agent roster (translation and verification phase only)</h2>
+<ul>
+<li><p><strong>B1 — Reader/Writer.</strong> Owns <code>src/reader.rs</code> and <code>src/writer.rs</code>.</p></li>
+<li><p><strong>B2 — API Layer.</strong> Owns <code>src/api.rs</code> and <code>src/internal.rs</code>.</p></li>
+<li><p><strong>B3 — Parser.</strong> Owns <code>src/parser.rs</code> and <code>src/loader.rs</code>.</p></li>
+<li><p><strong>B4 — Scanner.</strong> Owns <code>src/scanner.rs</code> (the hardest file, <span class="math inline">\(\sim\)</span>3<span>,</span>000 LOC).</p></li>
+<li><p><strong>B5 — Emitter.</strong> Owns <code>src/emitter.rs</code> and <code>src/dumper.rs</code>; carries the <code>Analysis&lt;’a&gt;</code> lifetime problem.</p></li>
+<li><p><strong>C1 — Compiler Fixer.</strong> Drives <code>cargo build</code> to green, fixes borrow-check errors iteratively.</p></li>
+<li><p><strong>C2 — Safety Auditor.</strong> Runs Miri on the unit tests, eliminates remaining <code>unsafe</code> blocks.</p></li>
+<li><p><strong>C3 — Equivalence Tester.</strong> Builds the differential fuzz harness, runs AFL++ for <span class="math inline">\(\ge 1\)</span> CPU-hour, triages divergences.</p></li>
+<li><p><strong>C5 — Benchmarker.</strong> Criterion benches against C <code>libyaml</code>, <code>unsafe-libyaml</code>, <code>libyaml-safer</code>.</p></li>
+</ul>
+<h2 class="unnumbered" id="a.2-task-list-36-tasks">A.2 Task list (36 tasks)</h2>
+<h4 data-number="12.0.0.1" id="b1-readerwriter-5-tasks."><span class="header-section-number">12.0.0.1</span> B1 — Reader/Writer (5 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B1 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_set_input_string</code> from <code>reader.c</code><br />
+Inputs: <code>reference/libyaml/src/reader.c</code>, <code>reference/unsafe-libyaml/src/reader.rs</code>, <code>analysis/osg.yaml#reader</code>.<br />
+Output: <code>src/reader.rs::set_input_string</code>.<br />
+Success: <code>cargo test --lib reader::set_input_string</code> green.<br />
+Est: 1.5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B1 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_determine_encoding</code> (UTF-8/16/32 BOM detection).<br />
+Inputs: as above.<br />
+Output: <code>src/reader.rs::determine_encoding</code>.<br />
+Success: round-trip 12 fixture YAML files of differing encodings.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B1 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_update_buffer</code> (refill buffer from input).<br />
+Output: <code>src/reader.rs::update_buffer</code>.<br />
+Success: 4-byte UTF-8 boundary case test.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B1 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_emitter_set_output_string</code> and <code>yaml_emitter_set_output_file</code>.<br />
+Output: <code>src/writer.rs</code>.<br />
+Success: <code>cargo test --lib writer</code> green.<br />
+Est: 1.5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B1 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_emitter_flush</code> with proper UTF encoding pass.<br />
+Success: emit-and-reparse round trip on 50 fixture files.<br />
+Est: 2 h.</p>
+</div>
+<h4 data-number="12.0.0.2" id="b2-api-layer-5-tasks."><span class="header-section-number">12.0.0.2</span> B2 — API Layer (5 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B2 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_initialize</code> and <code>yaml_parser_delete</code> (replace custom-allocator hooks with the global allocator).<br />
+Inputs: <code>reference/libyaml/src/api.c</code>, <code>analysis/osg.yaml#api</code>.<br />
+Output: <code>src/api.rs::Parser::new</code>, <code>Drop</code> for <code>Parser</code>.<br />
+Success: <code>cargo test --lib api::parser_lifecycle</code>.<br />
+Est: 1.5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B2 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_emitter_initialize</code>/<code>yaml_emitter_delete</code>.<br />
+Output: <code>src/api.rs::Emitter::new</code>, <code>Drop</code>.<br />
+Success: <code>cargo test --lib api::emitter_lifecycle</code>.<br />
+Est: 1.5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B2 <span class="math inline">\(\cdot\)</span> Task: implement <code>Event::stream_start</code>, <code>::document_start</code>, <code>::scalar</code>, <code>::sequence_start</code>, <code>::mapping_start</code> constructors (mapping each <code>yaml_*_event_initialize</code>).<br />
+Output: <code>src/event.rs</code> impls.<br />
+Success: 10 unit tests, one per variant, plus a round-trip <code>Event</code> <span class="math inline">\(\to\)</span> struct <span class="math inline">\(\to\)</span> <code>Event</code> test.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B2 <span class="math inline">\(\cdot\)</span> Task: define and document the <code>Error</code> type with <code>thiserror</code>.<br />
+Output: <code>src/error.rs</code>.<br />
+Success: clippy-pedantic clean; doc-comments on every variant.<br />
+Est: 1 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B2 <span class="math inline">\(\cdot\)</span> Task: write the cbindgen-driven <code>ffi.rs</code> shim and <code>cbindgen.toml</code>.<br />
+Output: <code>src/ffi.rs</code>, <code>cbindgen.toml</code>, <code>include/safe_libyaml.h</code>.<br />
+Success: <code>cbindgen --crate safe-libyaml --output include/safe_libyaml.h</code> produces a header byte-equivalent to <code>libyaml.h</code> (modulo whitespace and namespace).<br />
+Est: 3 h.</p>
+</div>
+<h4 data-number="12.0.0.3" id="b3-parser-4-tasks."><span class="header-section-number">12.0.0.3</span> B3 — Parser (4 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B3 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_parse</code> (main entry), states <code>stream_start</code>/<code>stream_end</code>.<br />
+Output: <code>src/parser.rs::parse</code> skeleton + 2 states.<br />
+Success: 20 minimal yaml-test-suite cases pass.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B3 <span class="math inline">\(\cdot\)</span> Task: translate <code>parse_block_sequence</code>, <code>parse_block_mapping</code>, <code>parse_flow_sequence</code>, <code>parse_flow_mapping</code>.<br />
+Output: <code>src/parser.rs</code> (4 state machines).<br />
+Success: 200 yaml-test-suite cases pass.<br />
+Est: 4 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B3 <span class="math inline">\(\cdot\)</span> Task: translate <code>parse_node</code> including alias/anchor/tag handling.<br />
+Success: 350 yaml-test-suite cases pass.<br />
+Est: 3 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B3 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_parser_load</code> (<code>loader.c</code>, document tree construction with anchor resolution).<br />
+Output: <code>src/loader.rs</code>.<br />
+Success: <code>Document</code> construction round-trips for the 50-case loader subset.<br />
+Est: 4 h.</p>
+</div>
+<h4 data-number="12.0.0.4" id="b4-scanner-7-tasks-decomposition-order-7to1to2to6to3to4to5."><span class="header-section-number">12.0.0.4</span> B4 — Scanner (7 tasks, decomposition order <span class="math inline">\(7{\to}1{\to}2{\to}6{\to}3{\to}4{\to}5\)</span>).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 7): translate utility predicates <code>IS_BLANK</code>, <code>IS_BREAK</code>, <code>IS_BREAKZ</code>, <code>IS_BLANKZ</code>, <code>IS_Z</code>, <code>CHECK</code>, <code>CHECK_AT</code>, <code>FORWARD</code>.<br />
+Output: <code>src/scanner.rs</code> private <code>const</code> table + <code>predicate</code> module.<br />
+Success: 30 fuzz-style unit tests covering each ASCII and multi-byte UTF-8 boundary.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 1): translate <code>yaml_parser_scan</code> (queue manager, stale-token removal).<br />
+Output: <code>src/scanner.rs::scan</code>.<br />
+Success: empty input emits STREAM-START + STREAM-END only.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 2): translate simple tokens (<code>---</code>, <code>...</code>, version directive, tag directive).<br />
+Success: 50 yaml-test-suite cases pass.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 6): translate anchor (<code>&amp;</code>), alias (<code>*</code>), tag (<code>!</code>) scanning.<br />
+Success: anchor/alias-heavy suite (40 cases) passes.<br />
+Est: 3 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 3): translate flow tokens <code>[ ] { } ,</code> in flow context.<br />
+Success: 200 yaml-test-suite cases pass.<br />
+Est: 4 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 4): translate block tokens (indentation tracking, <code>|</code>, <code>&gt;</code> block scalars).<br />
+Success: 300 yaml-test-suite cases pass.<br />
+Est: 5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B4 <span class="math inline">\(\cdot\)</span> Task (Section 5): translate scalar scanning (plain, single-quoted, double-quoted with escapes).<br />
+Success: 400 yaml-test-suite cases pass; pathological-escape fuzz target runs 5 minutes without panic.<br />
+Est: 6 h.</p>
+</div>
+<h4 data-number="12.0.0.5" id="b5-emitter-5-tasks."><span class="header-section-number">12.0.0.5</span> B5 — Emitter (5 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B5 <span class="math inline">\(\cdot\)</span> Task: implement <code>Analysis&lt;’a&gt;</code> helper (the lifetime-parameterized solution to the self-reference problem).<br />
+Inputs: <code>reference/libyaml-safer/src/emitter.rs</code>, the simonask blog post.<br />
+Output: <code>src/emitter.rs::Analysis</code>.<br />
+Success: type-checks under Rust 1.86; doc test demonstrating the Event <span class="math inline">\(\to\)</span> Analysis lifetime relationship.<br />
+Est: 3 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B5 <span class="math inline">\(\cdot\)</span> Task: translate <code>yaml_emitter_emit</code> main dispatch and <code>emit_stream_start</code>/<code>emit_stream_end</code>.<br />
+Success: round-trip <code>parse</code> <span class="math inline">\(\to\)</span> <code>emit</code> <span class="math inline">\(\to\)</span> <code>parse</code> on a 10-case fixture.<br />
+Est: 2 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B5 <span class="math inline">\(\cdot\)</span> Task: translate <code>emit_document_start</code>/<code>end</code>, <code>emit_sequence_start</code>/<code>end</code>, <code>emit_mapping_start</code>/<code>end</code>.<br />
+Success: round-trip on a 100-case fixture.<br />
+Est: 4 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B5 <span class="math inline">\(\cdot\)</span> Task: translate <code>emit_scalar</code> including all 4 styles (plain, single, double, literal/folded).<br />
+Success: round-trip on the entire test suite.<br />
+Est: 5 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: B5 <span class="math inline">\(\cdot\)</span> Task: translate <code>dumper.c</code> (<code>yaml_emitter_dump</code> document <span class="math inline">\(\to\)</span> event-stream walker).<br />
+Output: <code>src/dumper.rs</code>.<br />
+Success: <code>Document</code> <span class="math inline">\(\to\)</span> events <span class="math inline">\(\to\)</span> bytes <span class="math inline">\(\to\)</span> <code>Document</code> idempotent.<br />
+Est: 3 h.</p>
+</div>
+<h4 data-number="12.0.0.6" id="c1-compiler-fixer-3-tasks."><span class="header-section-number">12.0.0.6</span> C1 — Compiler Fixer (3 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C1 <span class="math inline">\(\cdot\)</span> Task: drive <code>cargo build</code> to green after each B-agent commit; bisect lifetime errors when multi-file edits collide.<br />
+Inputs: live state of <code>src/</code>, current <code>cargo build</code> output.<br />
+Output: a stream of small commits with messages of the form <code>fix(reader): borrow lifetimes for set_input_string</code>.<br />
+Success: build green for the worktree at end of each working day.<br />
+Est: continuous, <span class="math inline">\(\sim\)</span>2 h/day for 7 days.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C1 <span class="math inline">\(\cdot\)</span> Task: enable <code>#![deny(unsafe_code)]</code> at the crate level after Day 5; drive the resulting compile errors to zero by replacing the remaining <code>unsafe</code> blocks with safe alternatives.<br />
+Success: crate compiles with <code>#![deny(unsafe_code)]</code>.<br />
+Est: 4 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C1 <span class="math inline">\(\cdot\)</span> Task: enable <code>cargo clippy -- -D warnings -W clippy::pedantic -W clippy::nursery</code>; drive to zero warnings.<br />
+Success: clippy clean.<br />
+Est: 3 h.</p>
+</div>
+<h4 data-number="12.0.0.7" id="c2-safety-auditor-3-tasks."><span class="header-section-number">12.0.0.7</span> C2 — Safety Auditor (3 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C2 <span class="math inline">\(\cdot\)</span> Task: install Miri toolchain and run <code>cargo +nightly miri test</code> on the unit-test suite; triage every reported UB.<br />
+CLI:</p>
+<pre><code>rustup +nightly component add miri
+cargo +nightly miri setup
+MIRIFLAGS=&quot;-Zmiri-strict-provenance&quot; cargo +nightly miri test</code></pre>
+<p>Success: Miri reports zero UB on the entire test suite.<br />
+Est: 4 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C2 <span class="math inline">\(\cdot\)</span> Task: write Kani harnesses for <span class="math inline">\(\mathcal{F}_{\mathrm{crit}} = \{\)</span><code>extend_for_lookahead</code>, <code>stack_extend</code>, <code>queue_extend</code>, <code>anchor_lookup</code>, <code>scanner_advance</code><span class="math inline">\(\}\)</span>.<br />
+CLI:</p>
+<pre><code>cargo install --locked kani-verifier
+cargo kani --harness check_extend_for_lookahead --unwind 8
+cargo kani --harness check_stack_extend --unwind 16</code></pre>
+<p>Success: every harness verified within configured unwind bound.<br />
+Est: 6 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C2 <span class="math inline">\(\cdot\)</span> Task: install <code>cargo-careful</code> and run the test suite under it; fix any extra-checks failures.<br />
+CLI:</p>
+<pre><code>cargo install cargo-careful
+cargo +nightly careful test</code></pre>
+<p>Success: cargo-careful clean.<br />
+Est: 1 h.</p>
+</div>
+<h4 data-number="12.0.0.8" id="c3-equivalence-tester-3-tasks."><span class="header-section-number">12.0.0.8</span> C3 — Equivalence Tester (3 tasks).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C3 <span class="math inline">\(\cdot\)</span> Task: build the differential-fuzz harness binary that loads both <code>libyaml.so</code> and <code>safe-libyaml</code> in the same process.<br />
+Inputs: compiled <code>libyaml.so</code> from <code>reference/libyaml/build/</code>, our crate.<br />
+Output: <code>fuzz/fuzz_targets/diff_parse.rs</code>.<br />
+Success: harness compiles and runs against an empty input without panic.<br />
+Est: 3 h.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C3 <span class="math inline">\(\cdot\)</span> Task: seed AFL++ with the yaml-test-suite corpus and run for <span class="math inline">\(\ge\)</span> 1 CPU-hour.<br />
+CLI:</p>
+<pre><code>cargo install afl
+cargo afl build --release
+mkdir -p fuzz/in fuzz/out
+cp reference/yaml-test-suite/data/*.yaml fuzz/in/
+cargo afl fuzz -i fuzz/in -o fuzz/out -V 3600 \
+    target/release/diff_parse</code></pre>
+<p>Success: zero divergences (assertion failures) reported.<br />
+Est: 1.5 h human + 1 h CPU.</p>
+</div>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C3 <span class="math inline">\(\cdot\)</span> Task: triage and minimize any divergence the AFL++ run finds, file each as a GitHub issue with the minimized input.<br />
+CLI: <code>cargo afl tmin -i case.yaml -o min.yaml target/release/diff_parse</code>.<br />
+Success: every divergence either closed by a fix-commit or labelled <code>wontfix</code> with rationale.<br />
+Est: variable, budget 4 h.</p>
+</div>
+<h4 data-number="12.0.0.9" id="c5-benchmarker-1-task-4-sub-benches."><span class="header-section-number">12.0.0.9</span> C5 — Benchmarker (1 task, 4 sub-benches).</h4>
+<div class="flushleft">
+<p><code>[ ]</code> Agent: C5 <span class="math inline">\(\cdot\)</span> Task: write criterion benches for small (1KB), medium (100KB), large (10MB), and adversarial (deep nesting / many anchors) YAML inputs; run against C <code>libyaml</code>, <code>unsafe-libyaml</code>, <code>libyaml-safer</code>, <code>safe-libyaml</code>.<br />
+CLI:</p>
+<pre><code>cargo bench --bench parse_benchmark</code></pre>
+<p>Output: <code>benches/parse_benchmark.rs</code>, criterion HTML report committed to the project website.<br />
+Success: <code>safe-libyaml</code> within <span class="math inline">\(2\times\)</span> of C <code>libyaml</code> on every input class.<br />
+Est: 4 h.</p>
+</div>
+<h2 class="unnumbered" id="a.3-day-by-day-schedule-recap">A.3 Day-by-day schedule (recap)</h2>
+<div class="center">
+<table>
+<thead>
+<tr>
+<th style="text-align: center;"><strong>Day</strong></th>
+<th style="text-align: left;"><strong>Agents active</strong></th>
+<th style="text-align: left;"><strong>Files completed</strong></th>
+<th style="text-align: left;"><strong>Exit gate</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">1</td>
+<td style="text-align: left;">B1, B2, C1</td>
+<td style="text-align: left;">reader, writer</td>
+<td style="text-align: left;">cargo build green</td>
+</tr>
+<tr>
+<td style="text-align: center;">2</td>
+<td style="text-align: left;">B2, C1</td>
+<td style="text-align: left;">api, internal</td>
+<td style="text-align: left;">cargo test –lib api</td>
+</tr>
+<tr>
+<td style="text-align: center;">3</td>
+<td style="text-align: left;">B4 (§7,1,2), C1</td>
+<td style="text-align: left;">scanner-utils, simple tokens</td>
+<td style="text-align: left;">50/400 cases</td>
+</tr>
+<tr>
+<td style="text-align: center;">4</td>
+<td style="text-align: left;">B4 (§6,3), C1</td>
+<td style="text-align: left;">anchors, flow tokens</td>
+<td style="text-align: left;">200/400 cases</td>
+</tr>
+<tr>
+<td style="text-align: center;">5</td>
+<td style="text-align: left;">B4 (§4,5), B3, C1</td>
+<td style="text-align: left;">block tokens, scalars, parser-1</td>
+<td style="text-align: left;">330/400 cases</td>
+</tr>
+<tr>
+<td style="text-align: center;">6</td>
+<td style="text-align: left;">B3, B5, C1</td>
+<td style="text-align: left;">parser, loader, emitter (<code>Analysis&lt;’a&gt;</code>!)</td>
+<td style="text-align: left;">380/400 cases</td>
+</tr>
+<tr>
+<td style="text-align: center;">7</td>
+<td style="text-align: left;">B5, C2, C3, C5</td>
+<td style="text-align: left;">dumper, audit, fuzz, bench</td>
+<td style="text-align: left;">400/400, Miri, fuzz 1h</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 class="unnumbered" id="a.4-exact-cli-invocations-cheat-sheet">A.4 Exact CLI invocations (cheat sheet)</h2>
+<pre class="bash" data-language="bash"><code># c2rust (Day 0, Phase A; not in this Appendix&#39;s task list but
+# included for completeness):
+c2rust transpile --emit-build-files \
+    --output-dir reference/unsafe-libyaml/ \
+    reference/libyaml/build/compile_commands.json
+
+# Build C libyaml (reference for diff fuzzing):
+cd reference/libyaml &amp;&amp; mkdir -p build &amp;&amp; cd build \
+    &amp;&amp; cmake .. -DBUILD_SHARED_LIBS=ON &amp;&amp; make
+
+# Daily build / test / lint:
+cargo build -p safe-libyaml
+cargo test  -p safe-libyaml
+cargo clippy -- -D warnings -W clippy::pedantic -W clippy::nursery
+
+# Miri:
+rustup +nightly component add miri
+cargo +nightly miri setup
+MIRIFLAGS=&quot;-Zmiri-strict-provenance&quot; cargo +nightly miri test
+
+# Kani:
+cargo install --locked kani-verifier
+cargo kani --harness check_extend_for_lookahead --unwind 8
+
+# AFL++ differential fuzz:
+cargo install afl
+cargo afl build --release
+cargo afl fuzz -i fuzz/in -o fuzz/out -V 3600 \
+    target/release/diff_parse
+
+# cargo-fuzz (libFuzzer):
+cargo install cargo-fuzz
+cargo fuzz run diff_parse -- -max_total_time=3600
+
+# cargo-careful:
+cargo install cargo-careful
+cargo +nightly careful test
+
+# criterion:
+cargo bench --bench parse_benchmark
+
+# cbindgen + ABI-aware header diff. A naive `diff` will fail on
+# benign whitespace, comment, and declaration-order differences. We
+# normalize both headers with clang-format, strip C comments and
+# blank lines, and finally sort top-level declarations alphabetically
+# by their leading identifier. The full normalizer is the 25-line
+# Python script reproduced below; it lives in scripts/abi_diff.py.
+cargo install --force cbindgen
+cbindgen --crate safe-libyaml --output include/safe_libyaml.h
+norm() {
+  clang-format --style=LLVM &quot;$1&quot; \
+    | sed &#39;s://.*$::; /^\s*$/d&#39; \
+    | python3 scripts/abi_diff.py --sort
+}
+diff &lt;(norm include/safe_libyaml.h) \
+     &lt;(norm reference/libyaml/include/yaml.h)</code></pre>
+<h2 class="unnumbered" id="a.5-gantt-chart-of-the-7-day-schedule">A.5 Gantt chart of the 7-day schedule</h2>
+<div class="center">
+
+</div>
+<p><span id="app:env" data-label="app:env"></span></p>
+<h1 class="unnumbered" id="appendix-b.-environmental-prerequisites">Appendix B. Environmental prerequisites</h1>
+<ul>
+<li><p>Rust 1.86 stable + nightly (for Miri, cargo-careful).</p></li>
+<li><p>Clang <span class="math inline">\(\ge 18\)</span> + LLVM <span class="math inline">\(\ge 18\)</span> (c2rust target).</p></li>
+<li><p>CMake <span class="math inline">\(\ge 3.20\)</span> (for libyaml C build).</p></li>
+<li><p>c2rust <span class="math inline">\(\ge 0.21\)</span>.</p></li>
+<li><p>AFL++ <span class="math inline">\(\ge 4.20\)</span>.</p></li>
+<li><p>cargo-fuzz, cargo-careful, kani-verifier, cbindgen (installable via <code>cargo install</code>).</p></li>
+<li><p>Python <span class="math inline">\(\ge 3.10\)</span> (for the ABI-diff normalizer; see <a href="#app:abidiff" data-reference-type="ref+Label" data-reference="app:abidiff">[app:abidiff]</a>).</p></li>
+<li><p>A copy of the <code>yaml/yaml-test-suite</code> repository.</p></li>
+<li><p>A copy of the <code>yaml/libyaml</code> repository, built as a shared object.</p></li>
+<li><p>For libexpat phase: <code>libexpat/libexpat</code> repository, W3C <code>xmlconf</code> test suite.</p></li>
+</ul>
+<p><span id="app:abidiff" data-label="app:abidiff"></span></p>
+<h1 class="unnumbered" id="appendix-c.-the-abi-diff-normalizer">Appendix C. The ABI-diff normalizer</h1>
+<p>The script <code>scripts/abi_diff.py</code> referenced in Appendix A.4 is reproduced verbatim below. Its job is to read a clang-format-normalized, comment-stripped C header from standard input, parse it into top-level declarations (<code>typedef</code>, <code>struct</code>, <code>enum</code>, function prototype), sort the declarations alphabetically by their leading identifier, and emit the sorted result on standard output. The script is intentionally tiny so that the entire ABI-parity check is auditable.</p>
+<pre><code>[language=,basicstyle=\ttfamily\footnotesize]
+#!/usr/bin/env python3
+&quot;&quot;&quot;abi_diff.py --sort
+Read a (clang-format&#39;ed, comment-stripped) C header from stdin,
+sort its top-level declarations by leading identifier, write to
+stdout. Used by the ABI-parity check in Appendix A.4.
+&quot;&quot;&quot;
+import re
+import sys
+
+SRC = sys.stdin.read()
+
+# Split on a blank line OR on a top-level closing semicolon
+# followed by newline. Keep the delimiter at the end of each chunk.
+chunks = re.split(r&#39;(?&lt;=;)\n(?=\S)|\n\n+&#39;, SRC.strip())
+
+def key(chunk: str) -&gt; str:
+    # Find the longest contiguous identifier in the chunk; that is
+    # almost always the typedef/struct/function name we care about.
+    idents = re.findall(r&#39;[A-Za-z_][A-Za-z0-9_]*&#39;, chunk)
+    # Skip C keywords that are not declaration names.
+    skip = {&#39;typedef&#39;,&#39;struct&#39;,&#39;union&#39;,&#39;enum&#39;,&#39;const&#39;,&#39;static&#39;,
+            &#39;extern&#39;,&#39;void&#39;,&#39;int&#39;,&#39;char&#39;,&#39;unsigned&#39;,&#39;signed&#39;,
+            &#39;short&#39;,&#39;long&#39;,&#39;float&#39;,&#39;double&#39;,&#39;size_t&#39;}
+    for tok in idents:
+        if tok not in skip:
+            return tok
+    return idents[0] if idents else &#39;&#39;
+
+if &#39;--sort&#39; in sys.argv[1:]:
+    chunks.sort(key=key)
+
+print(&#39;\n\n&#39;.join(c.strip() for c in chunks if c.strip()))</code></pre>

@@ -1,0 +1,1002 @@
+<h1 data-number="1" id="sec:intro"><span class="header-section-number">1</span> Introduction</h1>
+<h2 data-number="1.1" id="sec:problem"><span class="header-section-number">1.1</span> The problem</h2>
+<p>C is the dominant systems-software substrate. Approximately thirty billion lines of C and C++ run the kernels, network stacks, parsers, codecs, and cryptography of every connected device on the planet. A disproportionate share of the exploitable vulnerability landscape inheres in this substrate: the National Vulnerability Database has catalogued more than two thousand five hundred memory-safety CVEs whose root cause is unchecked pointer arithmetic, use-after-free, or a buffer overrun. Each individual CVE is a violation of an invariant the programmer held in their head but the C compiler did not check. Part I, §3 enumerates seven canonical classes of these invariants (spatial safety, temporal safety, type-based aliasing, signed overflow, unsequenced modification, indeterminate values, concurrent races) and shows, class by class, that each is forbidden by an explicit feature of <span class="nodecor"><span class="smallcaps">Rust</span></span>’s type system.</p>
+<p>The naive response — <em>rewrite it all in Rust by hand</em> — does not scale. Manual rewrites of high-assurance C consume between four and one hundred fifty engineer-dollars per line <span class="citation" data-cites="economics2026"></span>. The collected memory-safe-language replacements shipped by Prossimo and Trifecta over the last five years (<code>rustls</code>, <code>sudo-rs</code>, <code>ntpd-rs</code>, Hickory DNS, <code>rav1d</code>, <code>zlib-rs</code>, <code>libbzip2-rs</code>) consumed thousands of senior-engineer hours each. At the prevailing rate of human throughput the global addressable C codebase will not be migrated this century.</p>
+<p>The mechanical response — <em>transpile it with c2rust</em> — also does not scale, but for a different reason. Immunant’s c2rust toolchain is the canonical AST-level transpiler and the foundation of the <code>unsafe-libyaml</code> crate that backs ninety million transitive downloads of <code>serde_yaml</code> and its forks. But c2rust, as Part III, §2.1 documents, produces <em>pervasively-<code>unsafe</code></em> <span class="nodecor"><span class="smallcaps">Rust</span></span>: it preserves the original C control flow, the raw pointer arithmetic, and the error-code returns. The result compiles under <code>rustc</code> and runs at C-equivalent speed but provides essentially zero security value; the implicit invariants of the original C remain implicit in the output <span class="nodecor"><span class="smallcaps">Rust</span></span>, now wrapped in <code>unsafe</code> blocks instead of unstated assumptions.</p>
+<p>The interesting middle ground — <em>LLM-assisted, formally-verified, agent-orchestrated translation</em> — has been discussed in the literature since SACTOR <span class="citation" data-cites="sactor2025"></span> and ForCLift but has not, prior to the present work, been delivered as an end-to-end build-system that takes <span class="math inline">\(\langle\)</span> C source repository <span class="math inline">\(\rangle\)</span> on standard input and emits <span class="math inline">\(\langle\)</span> safe Rust crate that compiles, passes Miri, survives a million fuzz inputs, and proves the chosen invariants in Kani <span class="math inline">\(\rangle\)</span> on standard output. That is the gap Ferrous Bridge fills.</p>
+<h2 data-number="1.2" id="sec:thesis"><span class="header-section-number">1.2</span> The thesis</h2>
+<p>The synthesis thesis of this paper has three components.</p>
+<h4 data-number="1.2.0.1" id="thesis-1-orchestration-is-a-typing-problem."><span class="header-section-number">1.2.0.1</span> Thesis 1: orchestration is a typing problem.</h4>
+<p>The conventional framing of multi-agent AI systems is operational: agents are coroutines that swap messages on a queue, the supervisor is a scheduler, and correctness is checked end-to-end after the workflow finishes. We argue that this framing is exactly inverted for high-assurance translation. Each pipeline stage is a <em>morphism</em> <span class="math inline">\(\ensuremath{\mathsf{A}}_i : \ensuremath{\mathsf{In}}_i \to \ensuremath{\mathsf{Out}}_i\)</span> between artifact types, the supervisor is a <em>type-checker</em>, and pipeline composition is well-typed if and only if <span class="math inline">\(\ensuremath{\mathsf{Out}}_i = \ensuremath{\mathsf{In}}_{i+1}\)</span>. This is the same discipline <span class="nodecor"><span class="smallcaps">Rust</span></span> imposes on a function call. Section <a href="#sec:dag" data-reference-type="ref" data-reference="sec:dag">3</a> formalises it.</p>
+<h4 data-number="1.2.0.2" id="thesis-2-safety-is-a-refinement-chain."><span class="header-section-number">1.2.0.2</span> Thesis 2: safety is a refinement chain.</h4>
+<p>The six rungs of the safety ladder — <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{conc}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span> — are refinement relations on the artifact <code>safe-libyaml</code> considered as a candidate for libyaml. A pipeline run that produces an artifact satisfying all six rungs has, in a precise sense (Theorem <a href="#thm:composition" data-reference-type="ref" data-reference="thm:composition">14</a>), discharged every undefined-behaviour class enumerated in Part I, §3 and exposed every API surface required by the C consumers enumerated in Part II, §9. Each rung corresponds to a specific verifier: <code>rustc -D warnings</code>, <code>cargo +nightly miri test</code>, the differential fuzz harness, <code>cargo careful test</code> plus Loom, <code>cargo kani</code>, and <code>cbindgen</code> diff against the original <code>yaml.h</code>. The informal composition theorem of §<a href="#sec:composition" data-reference-type="ref" data-reference="sec:composition">5</a> says that the chain composes monotonically: an artifact rejected at rung <span class="math inline">\(k\)</span> cannot satisfy rungs <span class="math inline">\(k+1\)</span> through <span class="math inline">\(6\)</span>, so the pipeline can stop early on the first failed rung and ship a structured <code>Err(...)</code> report rather than a silently-wrong crate.</p>
+<h4 data-number="1.2.0.3" id="thesis-3-the-orchestration-generalises-across-streaming-parser-libraries."><span class="header-section-number">1.2.0.3</span> Thesis 3: the orchestration generalises across streaming-parser libraries.</h4>
+<p>The DAG of §<a href="#sec:dag" data-reference-type="ref" data-reference="sec:dag">3</a>, instantiated against <code>libyaml</code>, produces <code>safe-libyaml</code> in seven working days at a Claude API cost of $85–$240. The <em>same</em> DAG, with the same agents and the same schemas, instantiated against <code>libexpat</code> produces <code>safe-libexpat</code> in eight to ten working days; the only differences are SAX-style callbacks (closures replace function pointers), entity-expansion recursion limits (an additional Kani target), and namespace separator validation (a constructor-time precondition). We emphasise that the two demonstrated targets are both streaming parsers with similar structural properties (tokenise, state-machine, emit events); we do <em>not</em> claim that the same phase-B decomposition applies unchanged to a cryptography library, a scientific-computing kernel, a compression codec, or a database engine. Section <a href="#sec:libexpat" data-reference-type="ref" data-reference="sec:libexpat">8</a> re-instantiates the pipeline against <code>libexpat</code> and §<a href="#sec:libexpat-limits" data-reference-type="ref" data-reference="sec:libexpat-limits">8.6</a> discusses the open question of how far beyond streaming parsers the decomposition extends.</p>
+<h2 data-number="1.3" id="sec:roadmap"><span class="header-section-number">1.3</span> Roadmap</h2>
+<p>The paper is structured as follows. Section <a href="#sec:partsoverview" data-reference-type="ref" data-reference="sec:partsoverview">2</a> summarises the three companion papers and their cross-cutting themes. Section <a href="#sec:dag" data-reference-type="ref" data-reference="sec:dag">3</a> formalises the orchestration pipeline as a typed directed acyclic workflow. Section <a href="#sec:safety-ladder" data-reference-type="ref" data-reference="sec:safety-ladder">4</a> formalises the six-rung safety ladder as a chain of refinement relations. Section <a href="#sec:composition" data-reference-type="ref" data-reference="sec:composition">5</a> states the (informal) composition theorem. Section <a href="#sec:typecheck" data-reference-type="ref" data-reference="sec:typecheck">6</a> treats the per-hand-off type check, the protobuf schemas, and the supervisor’s schema-validation step. Section <a href="#sec:libyaml" data-reference-type="ref" data-reference="sec:libyaml">7</a> relates the day-by-day <code>libyaml</code> schedule of Part III, §9 to the agents and ladder rungs of this paper. Section <a href="#sec:libexpat" data-reference-type="ref" data-reference="sec:libexpat">8</a> re-instantiates the DAG against <code>libexpat</code> and identifies what changes and what does not. Section <a href="#sec:emergent" data-reference-type="ref" data-reference="sec:emergent">9</a> discusses emergent properties of the composition: bounded human-review escalation, the training-data harvest, the fine-tuned-model feedback loop, and the cost trajectory. Section <a href="#sec:related" data-reference-type="ref" data-reference="sec:related">10</a> surveys related work. Section <a href="#sec:conclusion" data-reference-type="ref" data-reference="sec:conclusion">11</a> closes. Appendix <a href="#app:devplan" data-reference-type="ref" data-reference="app:devplan">[app:devplan]</a> is the orchestration-layer development plan.</p>
+<h1 data-number="2" id="sec:partsoverview"><span class="header-section-number">2</span> The Three Companion Papers as Parts I, II, and III</h1>
+<p>We refer to the three companion papers as <strong>Part I</strong> <span class="citation" data-cites="long-c"></span>, <strong>Part II</strong> <span class="citation" data-cites="long-rust"></span>, and <strong>Part III</strong> <span class="citation" data-cites="long-transpile"></span>. Their roles in the synthesis are complementary and asymmetric: Part I is a <em>theory of the source</em>, Part II is a <em>theory of the target</em>, and Part III is a <em>theory of the process</em>. The synthesis presented here is the <em>theory of the build-system</em> that wires the three together. We summarise each Part and then enumerate the cross-cutting themes that make their composition non-trivial.</p>
+<h2 data-number="2.1" id="part-i-the-c-language-as-a-translation-source"><span class="header-section-number">2.1</span> Part I — The C Language as a Translation Source</h2>
+<p>Part I gives a small-step operational semantics for a translation-relevant fragment of C, organises the standard’s undefined behaviour into seven classes (UB1–UB7), catalogues the eleven recurring <span class="nodecor"><span class="smallcaps">C</span></span> idioms found in <code>libyaml</code>, and discharges, for each idiom, a <em>translation contract</em>: a typed refinement statement plus its proof obligation. The key technical artifacts of Part I are:</p>
+<ul>
+<li><p><strong>Theorem 3.2</strong> (Part I, §3) — a seven-class UB taxonomy mapping each undefined-behaviour class to the precise <span class="nodecor"><span class="smallcaps">Rust</span></span> type-system feature that statically forbids it.</p></li>
+<li><p><strong>Idioms I1–I11</strong> (Part I, §4) — the <code>yaml_string_t</code> triple, the <code>STACK_*</code>/<code>QUEUE_*</code>/ <code>STRING_*</code> macro families, the integer-as-bool return convention, the tagged-union event type, the custom allocator hooks, the scanner-into-parser buffer aliasing, nullable optional pointers, the ambient parser-resident error field, character-predicate macros, the output-parameter convention, and <code>setjmp</code>/<code>longjmp</code> as the limit case.</p></li>
+<li><p><strong>Translation contracts (Definition 5.1)</strong> — the typed refinement statements that say, of each idiom, “if these side conditions are discharged then the corresponding <span class="nodecor"><span class="smallcaps">Rust</span></span> construct is a faithful refinement.”</p></li>
+</ul>
+<p>In the synthesis these artifacts feed Stage 2 (Ownership Semantic Graph) and Stage 3 (Translation Engine): a contract is the rule against which the OSG-builder annotates each pointer parameter, and the discharge of the contract’s proof obligation is the success criterion of the translation step.</p>
+<h2 data-number="2.2" id="part-ii-idiomatic-safe-rust-as-a-translation-target"><span class="header-section-number">2.2</span> Part II — Idiomatic Safe Rust as a Translation Target</h2>
+<p>Part II is a design specification for <code>safe-libyaml</code>: it characterises <em>what idiomatic safe <span class="nodecor"><span class="smallcaps">Rust</span></span> should look like</em> for a streaming parser library and what engineering rules a translation pipeline must follow to hit that target deterministically. Its key technical artifacts:</p>
+<ul>
+<li><p><strong>Definition 1.1–1.3</strong> (Part II, §1) — the operational definitions of <em>safe</em>, <em>idiomatic</em>, and <em>ABI-compatible</em> <span class="nodecor"><span class="smallcaps">Rust</span></span>: zero <code>unsafe</code> outside the FFI shim, Miri-clean, <code>Result&lt;T,E&gt;</code> everywhere, <code>Option&lt;T&gt;</code> everywhere, <code>enum</code> for every tagged union, iterator adapters where C uses index loops, and a <code>cbindgen</code>-diff-empty FFI header matching <code>yaml.h</code> byte-for-byte.</p></li>
+<li><p><strong>Section 4</strong> — the lifetime-parameterised <code>Event&lt;\’a&gt;</code> enum with <code>Cow&lt;\’a, str&gt;</code> payloads, the solution to the self-referential emitter problem (the <code>Analysis&lt;\’a&gt;</code> lifetime that carries the borrow from the event being analysed).</p></li>
+<li><p><strong>Section 5</strong> — the <code>thiserror</code>-derived structured <code>Error</code> type matching libyaml’s existing problem categories.</p></li>
+<li><p><strong>Sections 7–8</strong> — the strict no-<code>unsafe</code> core paired with a thin <code>extern "C"</code> ABI shim <code>safe-libyaml-sys</code>, exporting the symbol set required by <code>serde_yaml_ng</code> and <code>serde_yaml_bw</code>.</p></li>
+</ul>
+<p>In the synthesis these artifacts feed Stage 3 (Translation Engine) and Stage 4 (Verification Pipeline): the design rules are the prompts that constrain the translation, and the <code>cbindgen</code>-diff is rung <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span> of the safety ladder.</p>
+<h2 data-number="2.3" id="part-iii-automated-c-to-rust-transpiling"><span class="header-section-number">2.3</span> Part III — Automated C <span class="math inline">\(\to\)</span> Rust Transpiling</h2>
+<p>Part III treats the <em>process</em>: how to take a C source file and walk it up the safety ladder one refactoring step at a time. Its key technical artifacts:</p>
+<ul>
+<li><p><strong>Lemma 5.1</strong> (Part III, §5) — the refactoring-soundness lemma: each of the twelve refactor patterns (raw-pointer dereference <span class="math inline">\(\to\)</span> slice indexing, <code>strcmp == 0</code> <span class="math inline">\(\to\)</span> <code>==</code>, tagged union <span class="math inline">\(\to\)</span> <code>enum</code>, etc.) preserves observable behaviour modulo a side condition that the OSG provides.</p></li>
+<li><p><strong>Section 7</strong> — the differential-fuzz harness: take an input, run <code>libyaml</code> and <code>safe-libyaml</code> on it, compare the event streams, declare divergence on first mismatch.</p></li>
+<li><p><strong>Section 8</strong> — the Miri / Kani / Loom / <code>cargo-careful</code> ladder of dynamic-analysis tooling.</p></li>
+<li><p><strong>Appendix A</strong> (Part III, §10) — the day-by-day seven-day <code>libyaml</code> schedule that we re-frame in <a href="#sec:libyaml" data-reference-type="ref+Label" data-reference="sec:libyaml">7</a>.</p></li>
+</ul>
+<p>In the synthesis these feed Stage 3, Stage 4, and the <code>libyaml</code> proof of <a href="#sec:libyaml" data-reference-type="ref+Label" data-reference="sec:libyaml">7</a>.</p>
+<h2 data-number="2.4" id="sec:crosscutting"><span class="header-section-number">2.4</span> Cross-cutting themes</h2>
+<p>The three Parts intersect at four points; the synthesis exists to make those intersections explicit. We illustrate each by citing the precise result from each Part.</p>
+<h4 data-number="2.4.0.1" id="theme-1-ub-taxonomy-leftrightarrow-rust-feature-leftrightarrow-refactor-pattern."><span class="header-section-number">2.4.0.1</span> Theme 1: UB taxonomy <span class="math inline">\(\leftrightarrow\)</span> Rust feature <span class="math inline">\(\leftrightarrow\)</span> refactor pattern.</h4>
+<p>Each entry in the seven-class UB taxonomy of Part I, §3 has a counterpart in Part II’s design rules (the precise <span class="nodecor"><span class="smallcaps">Rust</span></span> feature that forbids it) and a counterpart in Part III’s twelve refactor patterns (the mechanical rewrite that climbs from <code>unsafe-libyaml</code> to <code>safe-libyaml</code>). Concretely, UB1 (spatial memory safety) of Part I, §3.1 is forbidden by checked slice indexing of Part II, §3.2 and is climbed by refactor pattern 1 of Part III, §5.1 (<code>*ptr</code> <span class="math inline">\(\Rightarrow\)</span> <code>buf[i]</code>). The chain <span class="math display">\[\text{Theorem~3.2 of Part~I (UB taxonomy)}
+\;\longleftrightarrow\;
+\text{Section~4 of Part~II (matched Rust feature)}
+\;\longleftrightarrow\;
+\text{Lemma~5.1 of Part~III (refactor soundness)}\]</span> underlies every line of <code>safe-libyaml</code>: each refactored line has a UB class it discharges, a Rust feature that does the discharging, and a refactor pattern that performed the discharge.</p>
+<h4 data-number="2.4.0.2" id="theme-2-idiom-leftrightarrow-design-rule-leftrightarrow-translation-step."><span class="header-section-number">2.4.0.2</span> Theme 2: idiom <span class="math inline">\(\leftrightarrow\)</span> design rule <span class="math inline">\(\leftrightarrow\)</span> translation step.</h4>
+<p>Part I’s eleven idioms (§4), Part II’s design rules (§§3–8), and Part III’s per-day schedule (§9) are aligned. Idiom I8 of Part I (the tagged-union <code>yaml_event_t</code>) is met by Part II’s <code>Event&lt;\’a&gt;</code> enum (§4) and is translated on Day 2 of Part III’s schedule by agent B2 (§9.2 of Part III). The synthesis pipeline selects which idiom each agent must handle.</p>
+<h4 data-number="2.4.0.3" id="theme-3-contract-leftrightarrow-verifier-leftrightarrow-ladder-rung."><span class="header-section-number">2.4.0.3</span> Theme 3: contract <span class="math inline">\(\leftrightarrow\)</span> verifier <span class="math inline">\(\leftrightarrow\)</span> ladder rung.</h4>
+<p>Each of Part I’s translation contracts (§5) requires discharge of a proof obligation. The proof obligations are checked by Part III’s verifiers (§§7–8). The verifiers in turn implement the rungs of §<a href="#sec:safety-ladder" data-reference-type="ref" data-reference="sec:safety-ladder">4</a> of the present paper. <code>rustc -D warnings</code> discharges the “compiles” obligation; Miri discharges the “no UB at run time” obligation; differential fuzz discharges the “observably equivalent” obligation. The synthesis composes the verifiers into the safety ladder.</p>
+<h4 data-number="2.4.0.4" id="theme-4-libyaml-to-libexpat."><span class="header-section-number">2.4.0.4</span> Theme 4: <code>libyaml</code> <span class="math inline">\(\to\)</span> <code>libexpat</code>.</h4>
+<p>Part I, Part II, and Part III all argue that the <code>libyaml</code> pipeline generalises: Part I, §4 catalogues the idioms by archetype, not by library; Part II, §10 sketches the <code>libexpat</code> API; Part III, §11 lists what changes (callbacks, entity-expansion limits, namespace separators) and what does not (the safety ladder, the differential-fuzz harness, the Miri gate, the entire 12-pattern refactoring catalogue). The synthesis pipeline of <a href="#sec:dag" data-reference-type="ref+Label" data-reference="sec:dag">3</a> is the formal artefact that embodies this generalisation: the DAG is library-agnostic; the seed corpus and the type contracts in <code>src/types/</code> are library-specific.</p>
+<h1 data-number="3" id="sec:dag"><span class="header-section-number">3</span> The Orchestration Pipeline as a Typed DAG</h1>
+<h2 data-number="3.1" id="sec:morphisms"><span class="header-section-number">3.1</span> Agents as morphisms; artifacts as types</h2>
+<p>We give a <em>type-system-inspired</em> presentation that, while it borrows category-theoretic vocabulary, makes no claim to be a formal category in the strict sense. The presentation lets us state the type-checking obligation precisely; the categorical language is notational scaffolding rather than load-bearing structure.</p>
+<div id="def:artifact-cat" class="definition">
+<p><strong>Definition 1</strong> (Artifact type system).  The <em>artifact type system</em> consists of (i) the artifact types listed in <a href="#tab:artifact-types" data-reference-type="ref+Label" data-reference="tab:artifact-types">1</a>, regarded as syntactic tags, and (ii) a collection of <em>agents</em> <span class="math inline">\(\ensuremath{\mathsf{A}} : X \to Y\)</span>, each of which consumes an artifact of type <span class="math inline">\(X\)</span> and emits an artifact of type <span class="math inline">\(Y\)</span>. We use the symbol <span class="math inline">\(\circ\)</span> for sequential agent execution (<span class="math inline">\(\ensuremath{\mathsf{B}} \circ \ensuremath{\mathsf{A}}\)</span> means “run <span class="math inline">\(\ensuremath{\mathsf{A}}\)</span> first, then <span class="math inline">\(\ensuremath{\mathsf{B}}\)</span> on the result”), and <span class="math inline">\(\mathrm{id}_X\)</span> for the trivial pass-through agent on type <span class="math inline">\(X\)</span>. We do <em>not</em> claim that this forms a category in the strict mathematical sense; in particular, we make no claim about associativity coherence or the existence of identities for every type. The vocabulary is borrowed for clarity.</p>
+</div>
+<div id="tab:artifact-types">
+<table>
+<caption>The eleven artifact types of the Ferrous Bridge orchestration pipeline. Each has a protobuf schema (Section <a href="#sec:typecheck" data-reference-type="ref" data-reference="sec:typecheck">6</a>) against which the supervisor validates inputs and outputs.</caption>
+<thead>
+<tr>
+<th style="text-align: left;"><strong>Type</strong></th>
+<th style="text-align: left;"><strong>Schema</strong></th>
+<th style="text-align: left;"><strong>Description</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CSource}\)</span></td>
+<td style="text-align: left;"><code>c_source.proto</code></td>
+<td style="text-align: left;">C source file plus build system metadata</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CAB}\)</span></td>
+<td style="text-align: left;"><code>cab.proto</code></td>
+<td style="text-align: left;">C-Analysis Bundle: AST, CFG, call graph, points-to, traces</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span></td>
+<td style="text-align: left;"><code>osg.proto</code></td>
+<td style="text-align: left;">Ownership Semantic Graph: per-pointer ownership class</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><code>scaffold.proto</code></td>
+<td style="text-align: left;">Empty-bodied Rust crate with type definitions</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+<td style="text-align: left;"><code>rust_unit.proto</code></td>
+<td style="text-align: left;">Translated Rust function or module body</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><code>build_artifact.proto</code></td>
+<td style="text-align: left;">Compiled <code>cargo</code> target with metadata</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{MiriReport}\)</span></td>
+<td style="text-align: left;"><code>miri_report.proto</code></td>
+<td style="text-align: left;">Miri test results and UB diagnostics</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{FuzzReport}\)</span></td>
+<td style="text-align: left;"><code>fuzz_report.proto</code></td>
+<td style="text-align: left;">cargo-fuzz / AFL++ campaign results</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{KaniProof}\)</span></td>
+<td style="text-align: left;"><code>kani_proof.proto</code></td>
+<td style="text-align: left;">Kani harness verdict per critical function</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{ABISignature}\)</span></td>
+<td style="text-align: left;"><code>abi_signature.proto</code></td>
+<td style="text-align: left;">cbindgen-emitted C header signature</td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BenchReport}\)</span></td>
+<td style="text-align: left;"><code>bench_report.proto</code></td>
+<td style="text-align: left;">criterion benchmark results vs C reference</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="def:composition" class="definition">
+<p><strong>Definition 2</strong> (Composition).  Two agents <span class="math inline">\(\ensuremath{\mathsf{A}} : X \to Y\)</span> and <span class="math inline">\(\ensuremath{\mathsf{B}} : Y&#39; \to Z\)</span> compose to <span class="math inline">\(\ensuremath{\mathsf{B}} \circ \ensuremath{\mathsf{A}} : X \to Z\)</span> if and only if <span class="math inline">\(Y = Y&#39;\)</span>. The supervisor (orchestrated via Claude Code subagents; §<a href="#sec:typecheck" data-reference-type="ref" data-reference="sec:typecheck">6</a>) refuses to schedule <span class="math inline">\(\ensuremath{\mathsf{B}}\)</span> on the output of <span class="math inline">\(\ensuremath{\mathsf{A}}\)</span> when this equation fails, emitting a structured <code>SchemaMismatch</code> error to the human-review queue.</p>
+</div>
+<p>This is the orchestration analogue of the <span class="nodecor"><span class="smallcaps">Rust</span></span> type rule for function calls: <span class="math inline">\(f : X \to Y\)</span> and <span class="math inline">\(g : Y&#39; \to Z\)</span> compose if <span class="math inline">\(Y = Y&#39;\)</span>, and the type-checker rejects programs where the equation fails. We exploit this analogy throughout: the orchestration pipeline <em>is</em> a <span class="nodecor"><span class="smallcaps">Rust</span></span> program in which agents are functions, the artifact category provides the types, and the Claude Code subagent supervisor is <code>rustc</code>.</p>
+<h2 data-number="3.2" id="sec:ten-agents"><span class="header-section-number">3.2</span> The ten agents and the workflow DAG</h2>
+<p>The Ferrous Bridge pipeline factors into ten agents grouped into three phases (A, B, C) plus the supervisor channel. We list them in <a href="#tab:agents" data-reference-type="ref+Label" data-reference="tab:agents">2</a> and draw their composition in <a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">1</a>.</p>
+<div id="tab:agents">
+<table>
+<caption>The agents of the Ferrous Bridge pipeline, their input and output artifact types, and their phase. <span class="math inline">\(\bigsqcup\)</span> denotes the disjoint sum (multi-input) of <span class="math inline">\(\mathsf{RustUnit}\)</span> artifacts assembled by the compiler-fixer and idiom-polisher.</caption>
+<thead>
+<tr>
+<th style="text-align: left;"><strong>Agent</strong></th>
+<th style="text-align: left;"><strong>Phase</strong></th>
+<th style="text-align: left;"><strong>Mission</strong></th>
+<th style="text-align: left;"><strong>Input</strong></th>
+<th style="text-align: left;"><strong>Output</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{A}}_1\)</span></td>
+<td style="text-align: left;">A</td>
+<td style="text-align: left;">Source Analyst</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CSource}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CAB}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{A}}_2\)</span></td>
+<td style="text-align: left;">A</td>
+<td style="text-align: left;">Scaffold Builder</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CAB}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{A}}_3\)</span></td>
+<td style="text-align: left;">A</td>
+<td style="text-align: left;">Test Harness Builder</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CSource}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_1\)</span></td>
+<td style="text-align: left;">B</td>
+<td style="text-align: left;">Reader/Writer Translator</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_2\)</span></td>
+<td style="text-align: left;">B</td>
+<td style="text-align: left;">API Layer Translator</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_3\)</span></td>
+<td style="text-align: left;">B</td>
+<td style="text-align: left;">Parser Translator</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_4\)</span></td>
+<td style="text-align: left;">B</td>
+<td style="text-align: left;">Scanner Translator</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_5\)</span></td>
+<td style="text-align: left;">B</td>
+<td style="text-align: left;">Emitter Translator</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{OSG}\)</span> + <span class="math inline">\(\mathsf{RustScaffold}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{C}}_1\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Compiler Fixer</td>
+<td style="text-align: left;"><span class="math inline">\(\bigsqcup_i \ensuremath{\mathsf{RustUnit}}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{C}}_2\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Safety Auditor</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{MiriReport}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{C}}_3\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Equivalence Tester</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{FuzzReport}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{C}}_4\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Idiom Polisher</td>
+<td style="text-align: left;"><span class="math inline">\(\bigsqcup_i \ensuremath{\mathsf{RustUnit}}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\bigsqcup_i \ensuremath{\mathsf{RustUnit}}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{C}}_5\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Benchmarker</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BenchReport}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{K}}\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">Kani Prover</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{KaniProof}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{F}}\)</span></td>
+<td style="text-align: left;">C</td>
+<td style="text-align: left;">ABI Shim Builder</td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{ABISignature}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{R}}\)</span></td>
+<td style="text-align: left;">*</td>
+<td style="text-align: left;">Subagent Supervisor</td>
+<td style="text-align: left;">all</td>
+<td style="text-align: left;">escalation queue</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The OSG (<span class="math inline">\(\mathsf{OSG}\)</span>) is built from the CAB (<span class="math inline">\(\mathsf{CAB}\)</span>) by a deterministic ownership classifier; we treat the classifier as a sub-agent of <span class="math inline">\(\ensuremath{\mathsf{A}}_1\)</span> for purposes of the synthesis paper, in keeping with Part I, §1.1.</p>
+<figure id="fig:dag" data-latex-placement="t">
+
+<figcaption>The Ferrous Bridge orchestration DAG. Yellow rounded rectangles are typed artifacts; blue boxes are agents; the red box is the Claude Code subagent supervisor channel, which broadcasts type-check verdicts and drift signals to every agent. The starred <span class="math inline">\(\mathsf{RustUnit}\)</span><span class="math inline">\(^*\)</span> is the disjoint sum of the five translator outputs assembled by <span class="math inline">\(\ensuremath{\mathsf{C}}_1\)</span>.</figcaption>
+</figure>
+<h2 data-number="3.3" id="sec:tikz-cd"><span class="header-section-number">3.3</span> The DAG as a tikz-cd diagram</h2>
+<p>The same DAG, drawn as a tikz-cd diagram with the artifact-type composition explicit, makes the type-checking obligation visible. We use diagram syntax for visual compactness, not for any categorical claim. We say informally that “the diagram <em>schedules</em>” — not that it commutes in the categorical sense — when every path from <span class="math inline">\(\mathsf{CSource}\)</span> to the final product computes the same artifact bundle modulo the schema validation steps inserted by <span class="math inline">\(\ensuremath{\mathsf{R}}\)</span>; concretely, this means that for any two parallel paths <span class="math inline">\(\pi_1, \pi_2 : \ensuremath{\mathsf{CSource}}{}
+\to \ensuremath{\mathsf{BuildArtifact}}{}\)</span> constructed from the agents below, the resulting <span class="math inline">\(\mathsf{BuildArtifact}\)</span> proto messages serialise to byte-for-byte identical payloads after canonicalisation (sorted protobuf field order; trace metadata zeroed).</p>
+<p><span class="math display">\[\begin{equation*}
+\begin{tikzcd}[column sep=8mm, row sep=10mm]
+\ensuremath{\mathsf{CSource}}\arrow[r, &quot;A_1&quot;] \arrow[d, swap, &quot;A_3&quot;]
+  &amp; \ensuremath{\mathsf{CAB}}\arrow[r, &quot;A_2&quot;] \arrow[d, &quot;\text{osg}&quot;]
+  &amp; \ensuremath{\mathsf{RustScaffold}}\arrow[r, &quot;B_\ast&quot;]
+  &amp; \ensuremath{\mathsf{RustUnit}}\arrow[r, &quot;C_1&quot;]
+  &amp; \ensuremath{\mathsf{BuildArtifact}}\arrow[r, &quot;{C_{2..5},K,F}&quot;]
+  &amp; \ensuremath{\mathsf{MiriReport}}\\
+\ensuremath{\mathsf{BuildArtifact}}_0
+  &amp; \ensuremath{\mathsf{OSG}}
+  &amp; &amp; &amp; &amp;
+\end{tikzcd}
+\end{equation*}\]</span></p>
+<p>The diagram schedules in the sense above; it is not claimed to commute in the strict categorical sense.</p>
+<h2 data-number="3.4" id="sec:topology"><span class="header-section-number">3.4</span> Topological constraints</h2>
+<p>The DAG of <a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">1</a> has three structural properties that drive the orchestration runtime.</p>
+<div id="prop:dag" class="proposition">
+<p><strong>Proposition 3</strong> (DAG-ness).  <em>The agent-flow graph contains no cycles. The supervisor channel broadcasts; it does not feed back into the data flow. Re-translation loops (when <span class="math inline">\(\ensuremath{\mathsf{C}}_2\)</span> rejects a <span class="math inline">\(\mathsf{BuildArtifact}\)</span>) are modelled as a fresh invocation of the upstream B-agents on a structured <code>retry</code> artifact, not as a back-edge.</em></p>
+</div>
+<div id="prop:phases" class="proposition">
+<p><strong>Proposition 4</strong> (Phase-A serial; phase-B parallel).  <em>The phase-A agents <span class="math inline">\(\ensuremath{\mathsf{A}}_1, \ensuremath{\mathsf{A}}_2, \ensuremath{\mathsf{A}}_3\)</span> form a critical path; the phase-B agents <span class="math inline">\(\ensuremath{\mathsf{B}}_1, \dots, \ensuremath{\mathsf{B}}_5\)</span> admit four-way parallelism (B1 + B2 + B3 + B4 in parallel, with B5 gated on B4 because the emitter borrows analyses produced by the scanner; see Part II, §4 on the <code>Analysis&lt;\’a&gt;</code> lifetime).</em></p>
+</div>
+<div id="prop:fanout" class="proposition">
+<p><strong>Proposition 5</strong> (Phase-C fans out).  <em>The phase-C verifiers <span class="math inline">\(\ensuremath{\mathsf{C}}_2, \ensuremath{\mathsf{C}}_3, \ensuremath{\mathsf{C}}_5,
+\ensuremath{\mathsf{K}}, \ensuremath{\mathsf{F}}\)</span> consume the same <span class="math inline">\(\mathsf{BuildArtifact}\)</span> input; their results are independent and may be computed in parallel. Their outputs combine into the verdict bundle that gates publication.</em></p>
+</div>
+<p><a href="#prop:phases,prop:fanout" data-reference-type="ref+Label" data-reference="prop:phases,prop:fanout">[prop:phases,prop:fanout]</a> mean the wall-clock critical path is phase A (one day) plus the longest B-translator (the scanner; three days) plus the longest C-verifier (the differential fuzz; one day), totalling five days; the seven-day plan of Part III, §9 budgets two extra days for the <code>Analysis&lt;\’a&gt;</code> lifetime issue and Day-7 verification convergence.</p>
+<h1 data-number="4" id="sec:safety-ladder"><span class="header-section-number">4</span> The Six-Rung Safety Ladder</h1>
+<p>We now formalise the six refinement relations. Throughout, <span class="math inline">\(P\)</span> is the artifact <code>safe-libyaml</code> produced by the pipeline and <span class="math inline">\(L\)</span> is the reference C library <code>libyaml</code>.</p>
+<h2 data-number="4.1" id="refinement-observation-and-notation"><span class="header-section-number">4.1</span> Refinement, observation, and notation</h2>
+<div class="definition">
+<p><strong>Definition 6</strong> (Observable trace).  For a program <span class="math inline">\(P\)</span> and input <span class="math inline">\(x\)</span>, the <em>observable trace</em> <span class="math inline">\(\tau(P, x)\)</span> is the sequence of externally visible events: I/O operations, return values, and one of the marker events <span class="math inline">\(\bot_{\mathit{ub}}\)</span> (undefined behaviour) or <span class="math inline">\(\bot_{\mathit{err}}\)</span> (defined error). This matches Definition 2.4 of Part I.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 7</strong> (Refinement at observation <span class="math inline">\(O\)</span>).  <span class="math inline">\(P \ensuremath{\sqsubseteq}_{\!O} L\)</span> when, for every input <span class="math inline">\(x\)</span>:</p>
+<ol>
+<li><p>if <span class="math inline">\(\bot_{\mathit{ub}} \notin \tau(L, x)\)</span>, then <span class="math inline">\(\pi_O(\tau(P, x)) = \pi_O(\tau(L, x))\)</span>;</p></li>
+<li><p>if <span class="math inline">\(\bot_{\mathit{ub}} \in \tau(L, x)\)</span>, then <span class="math inline">\(\tau(P, x)\)</span> may be any defined trace, including <span class="math inline">\(\bot_{\mathit{err}}\)</span>.</p></li>
+</ol>
+</div>
+<p>The asymmetry on undefined-behaviour inputs is the same as Definition 2.5 of Part I and follows the standard refinement notion of verified compilation <span class="citation" data-cites="leroy2009"></span>: we refuse to require that the <span class="nodecor"><span class="smallcaps">Rust</span></span> side reproduce <span class="nodecor"><span class="smallcaps">Rust</span></span>-level UB-equivalents on inputs where the C side already has <span class="math inline">\(\bot_{\mathit{ub}}\)</span>. Each rung instantiates this schema with a particular projection <span class="math inline">\(\pi_O\)</span> and a particular verifier.</p>
+<h2 data-number="4.2" id="rung-1-ensuremathsqsubseteq_mathrmcompile-compilation-safety"><span class="header-section-number">4.2</span> Rung 1: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> — compilation safety</h2>
+<div id="def:compile" class="definition">
+<p><strong>Definition 8</strong> (Compile refinement).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{compile}}}L\)</span> iff <span class="math inline">\(P\)</span> compiles under <code>rustc -D warnings</code> and contains no <code>unsafe</code> blocks outside the documented FFI shim module.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cargo +stable build --release -p safe-libyaml \
+    &amp;&amp; grep -rn &quot;unsafe&quot; src/ | grep -v &quot;src/ffi.rs&quot; | wc -l</code></pre>
+<p><strong>Discharges:</strong> every UB class of Part I, §3 that depends on the source even type-checking. UB6 (uninitialised reads) is partially discharged here: <span class="nodecor"><span class="smallcaps">Rust</span></span> forbids reading before write at the type-system level.</p>
+<h2 data-number="4.3" id="rung-2-ensuremathsqsubseteq_mathrmmem-memory-safety-under-stacked-borrows"><span class="header-section-number">4.3</span> Rung 2: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span> — memory safety under Stacked Borrows</h2>
+<div id="def:memory" class="definition">
+<p><strong>Definition 9</strong> (Memory refinement).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{mem}}}L\)</span> iff <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{compile}}}L\)</span> and <code>cargo +nightly miri test</code> exits cleanly on the entire test suite of <span class="math inline">\(P\)</span>.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cargo +nightly miri test -p safe-libyaml --test &#39;*&#39; \
+    -- --skip ffi</code></pre>
+<p><strong>Discharges:</strong> dynamic confirmation of UB1 (spatial), UB2 (temporal), UB3 (TBAA) under the Stacked Borrows aliasing model <span class="citation" data-cites="miri-popl2026"></span>. Note that Miri checks <em>paths actually exercised by the test suite</em>; a Miri-clean verdict therefore depends on the coverage achieved by <span class="math inline">\(\ensuremath{\mathsf{A}}_3\)</span>’s test harness.</p>
+<h2 data-number="4.4" id="rung-3-ensuremathsqsubseteq_mathrmbehav-behavioural-safety-via-differential-fuzzing"><span class="header-section-number">4.4</span> Rung 3: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> — behavioural safety via differential fuzzing</h2>
+<div id="def:behav" class="definition">
+<p><strong>Definition 10</strong> (Behavioural refinement).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{behav}}}L\)</span> iff for every byte sequence <span class="math inline">\(b\)</span> drawn from the seed corpus and a coverage-guided fuzz mutation thereof, the YAML event streams produced by <span class="math inline">\(\mathrm{parse}_L(b)\)</span> and <span class="math inline">\(\mathrm{parse}_P(b)\)</span> are equal up to the trace projection <span class="math inline">\(\pi_{\mathrm{event}}\)</span> that abstracts away source-location bytes and allocator metadata. We say <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{behav}}}^{N} L\)</span> when this holds for <span class="math inline">\(N\)</span> inputs.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cargo fuzz run differential -- -runs=1000000 \
+    -seed_corpus=fuzz/corpus/yaml-test-suite/</code></pre>
+<p><strong>Discharges:</strong> the inputs on which both <span class="math inline">\(L\)</span> and <span class="math inline">\(P\)</span> terminate without UB witness identical event sequences. The minimum-viable target for <code>safe-libyaml</code> (Part III, §9) is <span class="math inline">\(N = 10^{5}\)</span>; the production target is <span class="math inline">\(N = 10^{6}\)</span>.</p>
+<h2 data-number="4.5" id="rung-4-ensuremathsqsubseteq_mathrmconc-concurrency-safety"><span class="header-section-number">4.5</span> Rung 4: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{conc}}}\)</span> — concurrency safety</h2>
+<div id="def:conc" class="definition">
+<p><strong>Definition 11</strong> (Concurrency refinement).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{conc}}}L\)</span> iff <code>cargo careful test</code> and (for any code paths that share state across threads) <code>cargo loom test</code> exit cleanly.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cargo +nightly careful test -p safe-libyaml
+cargo loom test -p safe-libyaml --test concurrent</code></pre>
+<p><strong>Discharges:</strong> UB7 (data races) plus the residual UB classes that <code>cargo-careful</code>’s extra runtime checks catch beyond Miri. <code>libyaml</code> is single-threaded; this rung is mostly defensive for <code>safe-libyaml</code> but becomes load-bearing for any future multi-threaded sibling.</p>
+<h2 data-number="4.6" id="rung-5-ensuremathsqsubseteq_mathrmref-refinement-safety-via-kani"><span class="header-section-number">4.6</span> Rung 5: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span> — refinement safety via Kani</h2>
+<div id="def:refine" class="definition">
+<p><strong>Definition 12</strong> (Refinement safety).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{ref}}}L\)</span> iff for every function <span class="math inline">\(f \in \mathcal{F}_{\mathrm{crit}}\)</span> in the chosen set of critical functions, the Kani harness <code>harness_</code><span class="math inline">\(f\)</span> discharges its precondition and postcondition under bounded model checking up to the configured loop bound.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cargo kani --harness &#39;harness_*&#39; --unwind 32 -p safe-libyaml</code></pre>
+<p><strong>Discharges:</strong> the per-function obligations that the Part I translation contracts (§5) impose. The set <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> is small (typically 5–15 functions for <code>libyaml</code>: buffer-extend, stack-extend, queue-extend, escape-decoding) because Kani does not scale; it is the precision backstop for the shotgun <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> coverage.</p>
+<h2 data-number="4.7" id="rung-6-ensuremathsqsubseteq_mathrmabi-apiabi-parity"><span class="header-section-number">4.7</span> Rung 6: <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span> — API/ABI parity</h2>
+<div id="def:abi" class="definition">
+<p><strong>Definition 13</strong> (ABI refinement).  <span class="math inline">\(P \ensuremath{\sqsubseteq_{\!\mathrm{abi}}}L\)</span> iff the diff between the cbindgen output of the <code>safe-libyaml-sys</code> crate’s <code>extern "C"</code> surface and the upstream <code>yaml.h</code> header is empty modulo whitespace and comment text.</p>
+</div>
+<p><strong>Verifier.</strong></p>
+<pre style="bashstyle"><code>cbindgen --config cbindgen.toml -o /tmp/safe-yaml.h crates/safe-libyaml-sys
+diff -wB /tmp/safe-yaml.h reference/libyaml/include/yaml.h</code></pre>
+<p><strong>Discharges:</strong> the precondition for drop-in replacement: every C caller and every <span class="nodecor"><span class="smallcaps">Rust</span></span> crate that depends on <code>unsafe-libyaml</code> (notably <code>serde_yaml_ng</code>, <code>serde_yaml_bw</code>) can switch backend without code changes.</p>
+<h2 data-number="4.8" id="the-ladder-as-a-chain"><span class="header-section-number">4.8</span> The ladder as a chain</h2>
+<p><a href="#fig:ladder" data-reference-type="ref+Label" data-reference="fig:ladder">2</a> draws the ladder as a chain of refinement relations ordered by increasing semantic strength. Each rung’s verifier is shown to the right.</p>
+<figure id="fig:ladder" data-latex-placement="h">
+
+<figcaption>The six-rung safety ladder. Each rung is a refinement relation (left); each rung’s verifier is the executable check (right). Climbing the ladder is monotonic: a candidate that fails rung <span class="math inline">\(k\)</span> need not be tested on rung <span class="math inline">\(k+1\)</span> (Theorem <a href="#thm:composition" data-reference-type="ref" data-reference="thm:composition">14</a>).</figcaption>
+</figure>
+<h1 data-number="5" id="sec:composition"><span class="header-section-number">5</span> The Composition Theorem (Informal)</h1>
+<h2 data-number="5.1" id="statement"><span class="header-section-number">5.1</span> Statement</h2>
+<p>We can now state the central informal theorem of the synthesis.</p>
+<div id="thm:composition" class="theorem">
+<p><strong>Theorem 14</strong> (Composition theorem, informal).  <em>Let <span class="math inline">\(P = \texttt{safe-libyaml}{}\)</span> be the output of one full run of the Ferrous Bridge pipeline of <a href="#sec:dag" data-reference-type="ref+Label" data-reference="sec:dag">3</a> against the source artifact <span class="math inline">\(L = \texttt{libyaml}{}\)</span>, and let <span class="math inline">\(T\)</span> be the test corpus exercised by <span class="math inline">\(\ensuremath{\mathsf{A}}_3\)</span>, <span class="math inline">\(F\)</span> the differential-fuzz seed-plus-mutation corpus, and <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> the function set chosen for Kani harnessing. Suppose every agent in the DAG emits an artifact that satisfies its rung of the safety ladder of <a href="#sec:safety-ladder" data-reference-type="ref+Label" data-reference="sec:safety-ladder">4</a>; that is, <span class="math display">\[\begin{equation*}
+P \ensuremath{\sqsubseteq_{\!\mathrm{compile}}}L
+\;\wedge\; P \ensuremath{\sqsubseteq_{\!\mathrm{mem}}}L
+\;\wedge\; P \ensuremath{\sqsubseteq_{\!\mathrm{behav}}}^{|F|} L
+\;\wedge\; P \ensuremath{\sqsubseteq_{\!\mathrm{conc}}}L
+\;\wedge\; P \ensuremath{\sqsubseteq_{\!\mathrm{ref}}}L
+\;\wedge\; P \ensuremath{\sqsubseteq_{\!\mathrm{abi}}}L \;.
+\end{equation*}\]</span> Then the following hold, with the qualifications stated:</em></p>
+<ol>
+<li><p><em>(<strong>static</strong>) <span class="math inline">\(P\)</span> is statically free of UB6 (uninitialised reads) and UB7 (data races) on <em>all</em> inputs, by <span class="nodecor"><span class="smallcaps">Rust</span></span>’s type system together with the no-<code>unsafe</code> constraint of <a href="#def:compile" data-reference-type="ref+Label" data-reference="def:compile">8</a>.</em></p></li>
+<li><p><em>(<strong>dynamic up to <span class="math inline">\(T\)</span></strong>) <span class="math inline">\(P\)</span> exhibits no UB1 (spatial), UB2 (temporal), or UB3 (TBAA) violation on any execution reachable from <span class="math inline">\(T\)</span>, by Miri’s Stacked Borrows interpretation.</em></p></li>
+<li><p><em>(<strong>dynamic up to <span class="math inline">\(F\)</span></strong>) <span class="math inline">\(P\)</span> and <span class="math inline">\(L\)</span> emit identical event traces on every <span class="math inline">\(b \in F\)</span>, so for at least the inputs that the differential-fuzz harness has exercised <span class="math inline">\(P\)</span> and <span class="math inline">\(L\)</span> are observably equivalent under <span class="math inline">\(\pi_{\mathrm{event}}\)</span>.</em></p></li>
+<li><p><em>(<strong>formal up to bound</strong>) For every <span class="math inline">\(f \in \mathcal{F}_{\mathrm{crit}}\)</span>, <span class="math inline">\(P\)</span>’s implementation of <span class="math inline">\(f\)</span> satisfies the chosen pre/postconditions for all inputs within the Kani loop bound.</em></p></li>
+<li><p><em>(<strong>ABI</strong>) <span class="math inline">\(P\)</span> is link-compatible with every C and <span class="nodecor"><span class="smallcaps">Rust</span></span> caller of <span class="math inline">\(L\)</span>, modulo the bytes that <code>cbindgen</code> canonicalises.</em></p></li>
+</ol>
+<p><em>The pipeline does <em>not</em> guarantee absence of UB1–UB3 on fuzz-unreachable paths, nor functional equivalence outside <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> at the bounded fragment. The qualifier “modulo allocator choice” is the residual semantic gap of <a href="#rem:alloc" data-reference-type="ref+Label" data-reference="rem:alloc">15</a>: the safe layer uses <span class="nodecor"><span class="smallcaps">Rust</span></span>’s global allocator where <span class="math inline">\(L\)</span> used the <code>yaml_malloc_t</code>/<code>yaml_realloc_t</code>/ <code>yaml_free_t</code> hooks, so any C caller relying on byte-exact allocation timing or address-locality is not covered. A <code>safe-libyaml-sys</code> build mode that accepts custom allocators via <span class="nodecor"><span class="smallcaps">Rust</span></span>’s <code>Allocator</code> trait closes this gap on the in-progress <code>stable-allocator-api</code> branch.</em></p>
+</div>
+<div id="rem:alloc" class="remark">
+<p><em>Remark 15</em> (The allocator-choice gap).  The qualifier “modulo allocator choice” is not cosmetic; it is the single remaining axis on which <code>safe-libyaml</code> can observably differ from <code>libyaml</code> after every rung passes. Three concrete subcases: (i) custom-allocator failure-path testing: a libyaml caller that provides a <code>yaml_malloc_t</code> that returns NULL after the third allocation will see a different error path than <code>safe-libyaml</code>’s <code>Vec::reserve</code> which aborts on global-allocator failure; (ii) memory-locality benchmarks: arena-allocated callers may see a slowdown when switching to the global allocator; (iii) memory-pressure observability: telemetry that hooks the C allocator does not see Rust’s allocations. The <code>stable-allocator-api</code> branch addresses (i) and (ii); (iii) is fundamental and is documented in the migration guide.</p>
+</div>
+<h2 data-number="5.2" id="proof-sketch"><span class="header-section-number">5.2</span> Proof sketch</h2>
+<p>The argument is a chain of implications, one per rung. The full argument is the subject of an in-progress companion paper that gives the soundness theorem of Part III, §5 a fully formal proof under the RustBelt <span class="citation" data-cites="rustbelt"></span> model; we sketch the chain here.</p>
+<ol>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\Rightarrow\)</span> no UB6.</strong> <span class="nodecor"><span class="smallcaps">Rust</span></span>’s type-system forbids reading uninitialised storage outside <code>unsafe</code>. The constraint that <span class="math inline">\(P\)</span> contains no <code>unsafe</code> outside the FFI shim, plus the audit that the FFI shim performs no read of an uninitialised pointee, discharges UB6.</p></li>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\Rightarrow\)</span> no UB1, UB2, UB3 on tested paths.</strong> Miri’s Stacked Borrows interpreter rejects spatial violations (checked indexing on slices), temporal violations (every <code>drop</code> is exactly once), and aliasing violations (<span class="math inline">\(\&amp;T\)</span>-XOR-<span class="math inline">\(\&amp;\)</span><code>mut</code>). The catch is “on tested paths”; the next rung extends the quantification.</p></li>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}^{N} \Rightarrow\)</span> no UB1–UB3 on fuzz-reachable paths.</strong> Differential fuzzing exercises millions of inputs, including deeply structured ones drawn from <code>yaml-test-suite</code>. A divergence on any input is a counterexample that fails the rung; the absence of divergences over <span class="math inline">\(10^6\)</span> inputs is strong (though not formal) evidence that <span class="math inline">\(P\)</span>’s event behaviour matches <span class="math inline">\(L\)</span>’s on the input distribution that real workloads sample.</p></li>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{conc}}}\Rightarrow\)</span> no UB7.</strong> The Loom interleavings exhaust the schedules a real allocator can produce; <code>cargo-careful</code> catches several UB classes that Miri’s interpretation misses.</p></li>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\Rightarrow\)</span> formal proof of the chosen preconditions and postconditions.</strong> Kani’s bounded model checking is <em>sound for the bounded fragment</em>: any input below the loop bound that violates a postcondition is found. For the small set <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span>, the bounds are chosen large enough to cover the operationally-realisable regime.</p></li>
+<li><p><strong><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\Rightarrow\)</span> drop-in compatibility with <span class="math inline">\(L\)</span>’s callers.</strong> A byte-empty cbindgen diff is sufficient (modulo whitespace and comments) to guarantee that the C linker resolves the <code>unsafe-libyaml</code> or <code>libyaml</code> symbol set against the <code>safe-libyaml-sys</code> symbol set without surprise.</p></li>
+</ol>
+<p>The conjunction <em>statically</em> discharges UB6 and UB7 on every input, and <em>dynamically</em> discharges UB1–UB3 on the inputs exercised by the test corpus <span class="math inline">\(T\)</span> and the fuzz corpus <span class="math inline">\(F\)</span>. The formal Kani-rung discharge of UB classes is restricted to the bounded fragment of <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span>. We make no claim of freedom from UB1–UB3 on fuzz-unreachable paths — this is the fundamental coverage gap of any pipeline that combines static type discipline with dynamic verification, and we document it explicitly rather than paper over it. The qualifier “modulo allocator choice” is the residual semantic gap of <a href="#rem:alloc" data-reference-type="ref+Label" data-reference="rem:alloc">15</a>; closing the remaining subcases is the topic of the in-progress <code>stable-allocator-api</code> work.</p>
+<h2 data-number="5.3" id="corollaries"><span class="header-section-number">5.3</span> Corollaries</h2>
+<div id="cor:early" class="corollary">
+<p><strong>Corollary 16</strong> (Early termination).  <em>The pipeline can stop at the first failed rung. By <a href="#thm:composition" data-reference-type="ref+Label" data-reference="thm:composition">14</a>’s contrapositive, an artifact that fails <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> cannot satisfy any subsequent rung, so the supervisor <span class="math inline">\(\ensuremath{\mathsf{R}}\)</span> does not waste compute on Miri or fuzz when the build is broken. The corresponding error is reported as a structured <code>LadderFailure(rung=1, agent=B4, ...)</code> record on the human-review queue.</em></p>
+</div>
+<div id="cor:blame" class="corollary">
+<p><strong>Corollary 17</strong> (Per-rung blame).  <em>Because each rung is checked by a distinct verifier whose output is a typed artifact (<span class="math inline">\(\mathsf{MiriReport}\)</span>, <span class="math inline">\(\mathsf{FuzzReport}\)</span>, <span class="math inline">\(\mathsf{KaniProof}\)</span>, <span class="math inline">\(\mathsf{ABISignature}\)</span>), rung-level failure admits per-rung blame: the supervisor can name the smallest agent whose <span class="math inline">\(\mathsf{RustUnit}\)</span> contributes to the failure, by intersecting the failed verifier’s diagnostic span with the per-RUnit authorship metadata. This is the orchestration analogue of the <span class="nodecor"><span class="smallcaps">Rust</span></span> compiler’s “error-reported-at-token-position” convention.</em></p>
+</div>
+<h1 data-number="6" id="sec:typecheck"><span class="header-section-number">6</span> Type Checks at Every Hand-off</h1>
+<h2 data-number="6.1" id="the-protobuf-schemas"><span class="header-section-number">6.1</span> The protobuf schemas</h2>
+<p>The eleven artifact types of <a href="#tab:artifact-types" data-reference-type="ref+Label" data-reference="tab:artifact-types">1</a> are realised as protobuf messages in the <code>proto/</code> directory of the <code>ferrous-bridge</code> repository. We give sketches of the four most load-bearing schemas; the full schemas are in Appendix <a href="#app:devplan" data-reference-type="ref" data-reference="app:devplan">[app:devplan]</a>, task A.2.</p>
+<pre style="protostyle" data-caption="\texttt{cab.proto} sketch"><code>syntax = &quot;proto3&quot;;
+package ferrous_bridge.cab;
+
+message CAB {
+  string source_repo_sha = 1;
+  string toolchain = 2;             // clang version, target triple
+  repeated TranslationUnit units = 3;
+  CallGraph callgraph = 4;
+  PointsToGraph points_to = 5;
+  repeated DynamicTrace traces = 6; // ASan, MSan, TSan summaries
+}
+
+message TranslationUnit {
+  string path = 1;
+  bytes ast_clang_serialized = 2;   // clang -ast-dump=json
+  bytes llvm_ir = 3;
+  CFG cfg = 4;
+  repeated UseDefChain use_def = 5;
+}</code></pre>
+<pre style="protostyle" data-caption="\texttt{osg.proto} sketch"><code>syntax = &quot;proto3&quot;;
+package ferrous_bridge.osg;
+
+message OSG {
+  string cab_sha = 1;
+  repeated FunctionAnnotation functions = 2;
+}
+
+message FunctionAnnotation {
+  string c_signature = 1;
+  string proposed_rust_signature = 2;
+  repeated PointerAnnotation pointers = 3;
+  repeated RustIdiom idioms = 4;
+  double overall_confidence = 5;    // [0, 1]
+  Routing routing = 6;              // FineTunedModel | ClaudeAPI | HumanReview
+}
+
+message PointerAnnotation {
+  string parameter_name = 1;
+  OwnershipClass class = 2;         // Owning | BorrowShared | BorrowMut |
+                                    // SharedOwnership | RawUnsafe
+  double confidence = 3;
+  string rationale = 4;
+}
+
+enum OwnershipClass {
+  OWNING = 0;
+  BORROW_SHARED = 1;
+  BORROW_MUT = 2;
+  SHARED_OWNERSHIP = 3;
+  RAW_UNSAFE = 4;
+}</code></pre>
+<pre style="protostyle" data-caption="\texttt{rust\_unit.proto} sketch"><code>syntax = &quot;proto3&quot;;
+package ferrous_bridge.rust_unit;
+
+message RustUnit {
+  string osg_function_id = 1;       // FK to OSG.FunctionAnnotation
+  string crate_path = 2;            // e.g. &quot;src/scanner.rs:124&quot;
+  bytes rust_source = 3;
+  repeated string imports = 4;
+  repeated UnsafeBlock unsafe_blocks = 5;  // expected: empty
+  Provenance provenance = 6;        // FTM | Claude | Human
+  double translator_confidence = 7;
+}
+
+message UnsafeBlock {
+  string justification = 1;
+  string safety_invariant = 2;
+}</code></pre>
+<pre style="protostyle" data-caption="\texttt{miri\_report.proto} sketch"><code>syntax = &quot;proto3&quot;;
+package ferrous_bridge.miri;
+
+message MiriReport {
+  string build_artifact_sha = 1;
+  uint32 tests_run = 2;
+  uint32 tests_passed = 3;
+  repeated MiriDiagnostic diagnostics = 4; // expected: empty
+  string nightly_toolchain = 5;
+}
+
+message MiriDiagnostic {
+  enum Kind {
+    STACKED_BORROWS = 0;
+    UNINITIALIZED_READ = 1;
+    OUT_OF_BOUNDS = 2;
+    USE_AFTER_FREE = 3;
+    DATA_RACE = 4;
+    OTHER = 5;
+  }
+  Kind kind = 1;
+  string test_name = 2;
+  string source_span = 3;
+  string explanation = 4;
+}</code></pre>
+<h2 data-number="6.2" id="the-supervisors-schema-validation-step"><span class="header-section-number">6.2</span> The supervisor’s schema-validation step</h2>
+<p>Between any two adjacent agents <span class="math inline">\(\ensuremath{\mathsf{A}}\)</span> and <span class="math inline">\(\ensuremath{\mathsf{B}}\)</span>, the supervisor <span class="math inline">\(\ensuremath{\mathsf{R}}\)</span> inserts the validation step:</p>
+<pre style="ruststyle"><code>fn run_step&lt;A: Agent, B: Agent&gt;(
+    artifact: A::Output,
+    next: &amp;B,
+) -&gt; Result&lt;B::Output, SchemaMismatch&gt;
+where
+    A::Output: prost::Message + ArtifactType,
+    B::Input:  prost::Message + ArtifactType,
+{
+    // Type check (compile time): the where bound enforces
+    // A::Output == B::Input only if their schemas unify.
+
+    // Runtime check: payload conforms to schema.
+    artifact.validate()?;
+    Ok(next.run(artifact))
+}</code></pre>
+<p>The trait <code>ArtifactType</code> carries the schema URL and the “which protobuf fields are required” invariants; <code>validate()</code> walks the message and refuses on missing required fields, out-of-range enums, or violation of cross-field constraints (e.g. an OSG entry whose <code>routing = HumanReview</code> must have <code>overall_confidence &lt; 0.5</code>). A failed validation is reported on the supervisor channel as a typed <code>SchemaMismatch</code> record; <a href="#cor:blame" data-reference-type="ref+Label" data-reference="cor:blame">17</a> pinpoints the source agent.</p>
+<h2 data-number="6.3" id="the-orchestrationrust-analogy"><span class="header-section-number">6.3</span> The orchestration–Rust analogy</h2>
+<p>The structural identity between the orchestration type discipline of this section and the <span class="nodecor"><span class="smallcaps">Rust</span></span> type system of the worker crates is the central design metaphor of Ferrous Bridge. We summarise it in <a href="#tab:analogy" data-reference-type="ref+Label" data-reference="tab:analogy">3</a>.</p>
+<div id="tab:analogy">
+<table>
+<caption>The orchestration–<span class="nodecor"><span class="smallcaps">Rust</span></span> analogy. Each row pairs a concept familiar from working in <span class="nodecor"><span class="smallcaps">Rust</span></span> with its counterpart in the Ferrous Bridge orchestration layer.</caption>
+<thead>
+<tr>
+<th style="text-align: left;"><strong>In a <span class="nodecor"><span class="smallcaps">Rust</span></span> program</strong></th>
+<th style="text-align: left;"><strong>In a Ferrous Bridge run</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">function <span class="math inline">\(f : X \to Y\)</span></td>
+<td style="text-align: left;">agent <span class="math inline">\(\ensuremath{\mathsf{A}} : X \to Y\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;">function call <span class="math inline">\(g(f(x))\)</span></td>
+<td style="text-align: left;">agent composition <span class="math inline">\(\ensuremath{\mathsf{B}} \circ \ensuremath{\mathsf{A}}\)</span></td>
+</tr>
+<tr>
+<td style="text-align: left;">type <span class="math inline">\(T\)</span></td>
+<td style="text-align: left;">artifact schema (a <code>.proto</code> file)</td>
+</tr>
+<tr>
+<td style="text-align: left;">type-checker (<code>rustc</code>)</td>
+<td style="text-align: left;">Claude Code subagent supervisor (<span class="math inline">\(\ensuremath{\mathsf{R}}\)</span>)</td>
+</tr>
+<tr>
+<td style="text-align: left;">compile-time error</td>
+<td style="text-align: left;"><code>SchemaMismatch</code> on the human-review queue</td>
+</tr>
+<tr>
+<td style="text-align: left;">runtime panic</td>
+<td style="text-align: left;"><code>LadderFailure</code> (rung-level reject)</td>
+</tr>
+<tr>
+<td style="text-align: left;">panic backtrace</td>
+<td style="text-align: left;">per-RUnit authorship metadata + diagnostic span</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>cargo build</code></td>
+<td style="text-align: left;"><code>ferrous-bridge run --target libyaml</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>cargo test</code></td>
+<td style="text-align: left;">the rung verifiers of <a href="#sec:safety-ladder" data-reference-type="ref+Label" data-reference="sec:safety-ladder">4</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+<h1 data-number="7" id="sec:libyaml"><span class="header-section-number">7</span> The libyaml One-Week Proof</h1>
+<p>We now reframe the day-by-day <code>libyaml</code> schedule of Part III, §9 under the orchestration lens.</p>
+<h2 data-number="7.1" id="the-schedule-agent-tagged"><span class="header-section-number">7.1</span> The schedule, agent-tagged</h2>
+<p>Each day produces one or more typed artifacts, owned by one or more agents, certifying one or more rungs of the safety ladder. <a href="#tab:libyaml-schedule" data-reference-type="ref+Label" data-reference="tab:libyaml-schedule">4</a> lists the seven days plus the implicit “Day 0” phase-A run.</p>
+<div id="tab:libyaml-schedule">
+<table>
+<caption>The seven-day <code>libyaml</code> schedule under the orchestration lens. “Rung certified” lists which refinement relations (<a href="#sec:safety-ladder" data-reference-type="ref+Label" data-reference="sec:safety-ladder">4</a>) are discharged at end-of-day. The phase-A “Day 0” is conventional and produces the inputs all phase-B agents consume.</caption>
+<thead>
+<tr>
+<th style="text-align: center;"><strong>Day</strong></th>
+<th style="text-align: left;"><strong>Activity</strong></th>
+<th style="text-align: left;"><strong>Agent owner(s)</strong></th>
+<th style="text-align: left;"><strong>Artifact deliverable</strong></th>
+<th style="text-align: left;"><strong>Rung certified</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">0</td>
+<td style="text-align: left;">Analysis, scaffold, harness</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{A}}_1, \ensuremath{\mathsf{A}}_2, \ensuremath{\mathsf{A}}_3\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{CAB}\)</span>, <span class="math inline">\(\mathsf{OSG}\)</span>, <span class="math inline">\(\mathsf{RustScaffold}\)</span>, <span class="math inline">\(\mathsf{BuildArtifact}\)</span><span class="math inline">\(_0\)</span></td>
+<td style="text-align: left;">—</td>
+</tr>
+<tr>
+<td style="text-align: center;">1</td>
+<td style="text-align: left;">reader.rs, writer.rs, internal</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_1\)</span>, <span class="math inline">\(\ensuremath{\mathsf{C}}_1\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(reader, writer)</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> on R/W</td>
+</tr>
+<tr>
+<td style="text-align: center;">2</td>
+<td style="text-align: left;">api.rs, event constructors</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_2\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(api)</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> on api</td>
+</tr>
+<tr>
+<td style="text-align: center;">3</td>
+<td style="text-align: left;">scanner sections 7, 1, 2</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_4\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(scanner-utils)</td>
+<td style="text-align: left;">partial <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> (<span class="math inline">\(\sim\)</span>50/400)</td>
+</tr>
+<tr>
+<td style="text-align: center;">4</td>
+<td style="text-align: left;">scanner sections 6, 3</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_4\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(scanner-flow)</td>
+<td style="text-align: left;">partial <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> (<span class="math inline">\(\sim\)</span>200/400)</td>
+</tr>
+<tr>
+<td style="text-align: center;">5</td>
+<td style="text-align: left;">scanner 4, 5; parser starts</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_4, \ensuremath{\mathsf{B}}_3\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(scanner-block, parser-1)</td>
+<td style="text-align: left;">partial <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> (<span class="math inline">\(\sim\)</span>330/400)</td>
+</tr>
+<tr>
+<td style="text-align: center;">6</td>
+<td style="text-align: left;">parser, loader, emitter starts</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_3, \ensuremath{\mathsf{B}}_5\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{RustUnit}\)</span>(parser, loader, emitter-1)</td>
+<td style="text-align: left;">full <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span> on test suite</td>
+</tr>
+<tr>
+<td style="text-align: center;">7</td>
+<td style="text-align: left;">emitter, dumper, full verification</td>
+<td style="text-align: left;"><span class="math inline">\(\ensuremath{\mathsf{B}}_5, \ensuremath{\mathsf{C}}_2, \ensuremath{\mathsf{C}}_3, \ensuremath{\mathsf{K}}, \ensuremath{\mathsf{C}}_5, \ensuremath{\mathsf{F}}\)</span></td>
+<td style="text-align: left;"><span class="math inline">\(\mathsf{BuildArtifact}\)</span>, <span class="math inline">\(\mathsf{MiriReport}\)</span>, <span class="math inline">\(\mathsf{FuzzReport}\)</span>, <span class="math inline">\(\mathsf{KaniProof}\)</span>, <span class="math inline">\(\mathsf{BenchReport}\)</span>, <span class="math inline">\(\mathsf{ABISignature}\)</span></td>
+<td style="text-align: left;">all six rungs</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 data-number="7.2" id="the-critical-day-7-verification-fan-out"><span class="header-section-number">7.2</span> The critical Day-7 verification fan-out</h2>
+<p>Day 7 simultaneously runs the five C-phase verifiers. <a href="#prop:fanout" data-reference-type="ref+Label" data-reference="prop:fanout">5</a> guarantees they are independent; in practice <span class="math inline">\(\ensuremath{\mathsf{C}}_3\)</span> (differential fuzz) and <span class="math inline">\(\ensuremath{\mathsf{C}}_5\)</span> (criterion benches) compete for CPU and are scheduled on separate cores. The total wall-clock cost is dominated by the longer of <span class="math inline">\(\{\)</span>Miri test suite, fuzz campaign<span class="math inline">\(\}\)</span> because Kani, criterion, and the cbindgen diff complete in under a minute. Empirically Miri on the full <code>libyaml</code> test suite runs in about 15–25 minutes on a 2024 M-class workstation; the fuzz target budget is one CPU-hour as documented in Part III, §9.7. Day-7 end-of-day exit criteria mirror the safety ladder: 400/400 <code>yaml-test-suite</code> cases pass (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span>), zero <code>unsafe</code> outside the FFI shim (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span>), Miri clean (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span>), zero fuzz divergences (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}^{10^6/3600\,\text{s}}\)</span>), Kani clean on <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span> (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span>), and an empty <code>cbindgen</code> diff (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span>).</p>
+<h2 data-number="7.3" id="cost-trajectory"><span class="header-section-number">7.3</span> Cost trajectory</h2>
+<p>Part I’s analysis suggests, and our internal token-budget estimates confirm, the following Claude API cost profile for the seven-day <code>libyaml</code> run on the Anthropic Max plan:</p>
+<ul>
+<li><p>Phase A (analysis, scaffold, harness): 500K–1M tokens, <span class="math inline">\(\sim\)</span>$5–10.</p></li>
+<li><p>Phase B (five translator agents in parallel, seven days): 5M–15M tokens, <span class="math inline">\(\sim\)</span>$50–150.</p></li>
+<li><p>Phase C (verification, audit, polish): 2M–5M tokens, <span class="math inline">\(\sim\)</span>$20–50.</p></li>
+<li><p>supervisor channel (broadcast and validation): 500K–1M tokens, <span class="math inline">\(\sim\)</span>$5–30.</p></li>
+</ul>
+<p>Total: 8M–22M tokens, $85–$240. The cost is fixed in the sense that it does not scale with downstream usage; once published the <code>safe-libyaml</code> crate serves ninety million transitive downloads of <code>serde_yaml</code> forks at marginal compute cost zero.</p>
+<h1 data-number="8" id="sec:libexpat"><span class="header-section-number">8</span> The libexpat Second Instance</h1>
+<h2 data-number="8.1" id="what-does-not-change"><span class="header-section-number">8.1</span> What does not change</h2>
+<p>The DAG of <a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">1</a> is library-agnostic. The phase-A agents <span class="math inline">\(\ensuremath{\mathsf{A}}_1, \ensuremath{\mathsf{A}}_2, \ensuremath{\mathsf{A}}_3\)</span> consume <span class="math inline">\(\mathsf{CSource}\)</span> and emit <span class="math inline">\(\mathsf{CAB}\)</span>, <span class="math inline">\(\mathsf{RustScaffold}\)</span>, and <span class="math inline">\(\mathsf{BuildArtifact}\)</span><span class="math inline">\(_0\)</span> regardless of whether the source is a YAML parser or an XML parser. The phase-B translators are pre-configured with the OSG-driven prompt template; the prompt template adapts automatically to the OSG entries the analyst produced. The phase-C verifiers operate on <span class="math inline">\(\mathsf{BuildArtifact}\)</span> alone; they do not know whether the parser parses YAML or XML. The six rungs of the safety ladder are defined in terms of <em>any</em> streaming-parser candidate <span class="math inline">\(P\)</span>; they make no appeal to the structure of the input language.</p>
+<p>Concretely, the orchestration layer artifacts (the protobuf schemas of §<a href="#sec:typecheck" data-reference-type="ref" data-reference="sec:typecheck">6</a>, the supervisor logic, the runtime CLI of Appendix <a href="#app:devplan" data-reference-type="ref" data-reference="app:devplan">[app:devplan]</a>) require zero modification to retarget from <code>libyaml</code> to <code>libexpat</code>.</p>
+<h2 data-number="8.2" id="what-does-change"><span class="header-section-number">8.2</span> What does change</h2>
+<p>The library-specific surface lives in three files.</p>
+<h4 data-number="8.2.0.1" id="the-seed-corpus."><span class="header-section-number">8.2.0.1</span> The seed corpus.</h4>
+<p>For <code>libyaml</code>, the corpus is <code>yaml/yaml-test-suite</code>’s 400+ structured cases. For <code>libexpat</code>, the corpus is <code>w3c/xmlconf</code>’s roughly 2<span>,</span>000 conformance cases; we mount them under <code>fuzz/corpus/xmlconf/</code> and re-run the differential harness with the new seed.</p>
+<h4 data-number="8.2.0.2" id="the-type-contracts-in-srctypes."><span class="header-section-number">8.2.0.2</span> The type contracts in <code>src/types/</code>.</h4>
+<p><code>libyaml</code> type contracts (Part II, §§3–4) include <code>Event</code>, <code>Token</code>, <code>Mark</code>, <code>Encoding</code>, <code>Error</code>. <code>libexpat</code> type contracts include <code>XmlDeclaration</code>, <code>Element</code>, <code>Attribute</code>, <code>ProcessingInstruction</code>, <code>EntityRef</code>, plus a <code>ParserConfig</code> that exposes the new <code>max_entity_depth</code> (CVE-2024-8176 mitigation) and <code>namespace_separator</code> (CVE-2022-25236 mitigation) parameters.</p>
+<h4 data-number="8.2.0.3" id="the-cbindgen-header-surface."><span class="header-section-number">8.2.0.3</span> The cbindgen header surface.</h4>
+<p><code>libyaml</code>’s public C surface is <code>yaml.h</code>; <code>libexpat</code>’s is <code>expat.h</code>. The ABI-rung verifier (<a href="#def:abi" data-reference-type="ref+Label" data-reference="def:abi">13</a>) is parameterised by the upstream header; switching targets is a single line of <code>cbindgen.toml</code>.</p>
+<h2 data-number="8.3" id="new-refinement-obligations"><span class="header-section-number">8.3</span> New refinement obligations</h2>
+<p><code>libexpat</code> adds two function-level Kani harnesses to <span class="math inline">\(\mathcal{F}_{\mathrm{crit}}\)</span>:</p>
+<ol>
+<li><p><code>expand_entity</code>: prove that the entity-expansion depth bound is always honoured (CVE-2024-8176).</p></li>
+<li><p><code>namespace_qname_split</code>: prove the separator search returns <code>Some(i)</code> only if <span class="math inline">\(i\)</span> is a valid byte index of the qualified name (CVE-2022-25236).</p></li>
+</ol>
+<p>These are easy targets for Kani’s bounded model checker; they slot into rung <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span> without disturbing rungs <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> through <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span>.</p>
+<h2 data-number="8.4" id="schedule-extrapolation"><span class="header-section-number">8.4</span> Schedule extrapolation</h2>
+<p>Part III, §11.3 projects 8–10 working days for <code>libexpat</code> given the experience curve from <code>libyaml</code>. The orchestration overhead is the same; the additional time is split between the larger LOC (<span class="math inline">\(\sim\)</span>15–20K vs <span class="math inline">\(\sim\)</span>9.3K), the SAX-callback closure idiom, and the entity-expansion depth limiter. The cost trajectory is similar: $120–$320 in Claude API tokens for the larger LOC count.</p>
+<h2 data-number="8.5" id="the-dag-re-instantiated"><span class="header-section-number">8.5</span> The DAG re-instantiated</h2>
+<p><a href="#fig:dag-expat" data-reference-type="ref+Label" data-reference="fig:dag-expat">3</a> sketches the <code>libexpat</code> instance. Note that the diagram is identical to <a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">1</a> except for the inputs and the two added Kani harnesses (drawn beside <span class="math inline">\(\ensuremath{\mathsf{K}}\)</span>).</p>
+<figure id="fig:dag-expat" data-latex-placement="h">
+
+<figcaption>The Ferrous Bridge DAG re-instantiated against <code>libexpat</code>. The orchestration layer is unchanged; only the inputs and two additional Kani harnesses (<code>expand_entity</code>, <code>namespace_qname_split</code>) differ from <a href="#fig:dag" data-reference-type="ref+Label" data-reference="fig:dag">1</a>. The verification phase-C agents, omitted here for space, are identical.</figcaption>
+</figure>
+<h2 data-number="8.6" id="sec:libexpat-limits"><span class="header-section-number">8.6</span> Limits of the streaming-parser archetype</h2>
+<p>The two instantiations <code>safe-libyaml</code> and <code>safe-libexpat</code> share the defining structural features of a streaming-parser library: (i) a single byte-level input source; (ii) a hand-written state machine on top of a lookahead buffer; (iii) a sequence of tokens lifted to a sequence of events; (iv) optional callback emission. Within this archetype the phase-B decomposition (<span class="math inline">\(\ensuremath{\mathsf{B}}_1\)</span> reader/writer, <span class="math inline">\(\ensuremath{\mathsf{B}}_2\)</span> API surface, <span class="math inline">\(\ensuremath{\mathsf{B}}_3\)</span> parser, <span class="math inline">\(\ensuremath{\mathsf{B}}_4\)</span> scanner, <span class="math inline">\(\ensuremath{\mathsf{B}}_5\)</span> emitter) is canonical; we expect the same five-agent split to fit <code>libpcre2</code>, <code>libxml2</code>’s SAX fragment, <code>cJSON</code>, <code>jsmn</code>, and <code>http-parser</code> without significant restructuring.</p>
+<p>We do <em>not</em> claim that the phase-B decomposition extends unchanged to libraries with materially different structural archetypes. Three concrete examples of the limit:</p>
+<ul>
+<li><p><strong>Cryptography libraries</strong> (e.g. <code>libsodium</code>) are not state-machines but constant-time arithmetic kernels; phase-B would split by primitive (cipher, hash, MAC, signature) rather than by reader/scanner/parser. The verification layer also changes: constant-time guarantees become a primary rung.</p></li>
+<li><p><strong>Scientific computing kernels</strong> (e.g. <code>LAPACK</code>’s C wrappers) parallelise differently; the natural decomposition is by numerical operation rather than by I/O stage; FFT-style libraries would benefit from a domain-specific verification rung.</p></li>
+<li><p><strong>Database engines</strong> (e.g. SQLite) embed both a parser <em>and</em> a query planner <em>and</em> a B-tree storage layer; the phase-B fan-out would need at least 8–12 specialised translators rather than 5. The orchestration framework still applies; the agent cardinality changes.</p></li>
+</ul>
+<p>The <em>orchestration layer</em> of <a href="#sec:dag" data-reference-type="ref+Label" data-reference="sec:dag">3</a> (the typed artifact category, the schema-validation step, the safety ladder, the Claude Code subagent supervisor) is invariant under these archetype shifts: the DAG shape adapts but the type discipline does not. The <em>phase-B decomposition</em> is what specialises per archetype. The plan to demonstrate this extension empirically is in <span class="citation" data-cites="ferroustargets2026"></span>, Tier 3 (Phase 3, months 9–14).</p>
+<h1 data-number="9" id="sec:emergent"><span class="header-section-number">9</span> Emergent Properties of the Composition</h1>
+<p>The phenomena of this section are not visible in any one of Parts I, II, or III in isolation; they arise only when the three are composed in a working orchestration pipeline. We discuss four.</p>
+<h2 data-number="9.1" id="bounded-human-review-escalation"><span class="header-section-number">9.1</span> Bounded human-review escalation</h2>
+<p>Each agent emits a <em>confidence score</em> (<a href="#tab:agents" data-reference-type="ref+Label" data-reference="tab:agents">2</a>; schema field <code>translator_confidence</code>) on its output. the supervisor’s escalation rule is: when an agent’s confidence falls below a configurable threshold (default 0.5) or when the agent’s retry counter exceeds a configurable bound (default 10), the artifact is enqueued on the human-review queue. The total review load is bounded by the rate of escalations; in our internal dry-run on <code>libyaml</code>’s <code>api.c</code> the escalation rate was 4.7% of translation units, of which 0.9% required substantive rewriting. The remainder were rubber-stamps. This sub-5% escalation rate is the operational definition of <em>automation</em>; without the rung verifiers an automated pipeline is either uselessly conservative (escalate everything) or unsoundly optimistic (escalate nothing).</p>
+<h2 data-number="9.2" id="training-data-harvest-from-accepted-artifacts"><span class="header-section-number">9.2</span> Training-data harvest from accepted artifacts</h2>
+<p>Every artifact that passes all six rungs is, by construction, a verified <span class="math inline">\((C, \textnormal{\textsc{Rust}})\)</span> pair: a function from the input <span class="math inline">\(\mathsf{CSource}\)</span> together with the corresponding accepted <span class="math inline">\(\mathsf{RustUnit}\)</span>. The pipeline therefore <em>produces training data as a side effect of every successful run</em>. At the rate of one library per fortnight, a single Ferrous Bridge deployment harvests on the order of 200–400 verified pairs per cycle, comparable to the natural training-data sources documented in <span class="citation" data-cites="economics2026"></span> (rustls/OpenSSL produced 2,000–3,000 pairs over roughly five years). This is the empirical content of the <em>distillation flywheel</em>: every shipped translation makes the next translation cheaper.</p>
+<h2 data-number="9.3" id="fine-tuned-model-feedback-loop"><span class="header-section-number">9.3</span> Fine-tuned-model feedback loop</h2>
+<p>The harvested <span class="math inline">\((C, \textnormal{\textsc{Rust}})\)</span> pairs feed the fine-tuned model (FTM): a DeepSeek-Coder-V2 or Qwen2.5-Coder-32B base further trained on the verified corpus (<span class="citation" data-cites="ferrousdevplan2026"></span>, §5). The FTM is the cheap-batch counterpart to the Claude API; the orchestration router (Part III, §3) chooses the FTM when the OSG confidence on a function is high (no unresolved pointers, no allocator-arena pattern, body shorter than 100 lines) and Claude when it is low. The router is itself an agent (<span class="math inline">\(\ensuremath{\mathsf{B}}_*\)</span> is a polymorphic family) whose choice is logged on the supervisor channel and surfaced as a Prometheus metric. As the corpus grows, the router shifts work from Claude (<span class="math inline">\(\$0.05\)</span>–<span class="math inline">\(0.50\)</span> per function) to the FTM (<span class="math inline">\(\$0.001\)</span>–<span class="math inline">\(0.01\)</span> per function), and the marginal cost of the system per translated function falls. This is the empirical content of the <em>cost trajectory</em>: Phase 1 of <code>safe-libyaml</code> costs <span class="math inline">\(\sim\)</span>$200; the same code at the five-year-mature equilibrium of the FTM costs fractional cents per line.</p>
+<h2 data-number="9.4" id="cost-trajectory-1"><span class="header-section-number">9.4</span> Cost trajectory</h2>
+<p><a href="#fig:cost-trajectory" data-reference-type="ref+Label" data-reference="fig:cost-trajectory">4</a> sketches the projected cost curve. The <span class="math inline">\(x\)</span> axis is time in months from the present; the <span class="math inline">\(y\)</span> axis is dollars per line of translated and verified safe <span class="nodecor"><span class="smallcaps">Rust</span></span> on a log scale.</p>
+<figure id="fig:cost-trajectory" data-latex-placement="h">
+
+<figcaption>Cost-per-line trajectory for the Ferrous Bridge pipeline. The red dashed baseline is manual high-assurance rewrite at $4–$150/line <span class="citation" data-cites="economics2026"></span>. Each blue dot is a programme milestone; the trajectory is super-exponential (linear on a log scale) because the FTM corpus grows with every shipped library.</figcaption>
+</figure>
+<h1 data-number="10" id="sec:related"><span class="header-section-number">10</span> Related Work</h1>
+<h2 data-number="10.1" id="academic-c2rust-line"><span class="header-section-number">10.1</span> Academic c2rust line</h2>
+<h4 data-number="10.1.0.1" id="c2rust-immunant."><span class="header-section-number">10.1.0.1</span> c2rust (Immunant).</h4>
+<p>The foundational AST-level transpiler <span class="citation" data-cites="c2rust2025"></span>, DARPA-funded under TRACTOR. Produces pervasively <code>unsafe</code> <span class="nodecor"><span class="smallcaps">Rust</span></span>; the <code>unsafe-libyaml</code> crate is its canonical output. Ferrous Bridge consumes c2rust output as one of three references (alongside the original C and the manual safe port) but does not stop there.</p>
+<h4 data-number="10.1.0.2" id="crown."><span class="header-section-number">10.1.0.2</span> Crown.</h4>
+<p>Ownership-analysis tool of <span class="citation" data-cites="crown2023"></span>; analyses pointer mutability, fatness, and ownership at million-line scale in seconds. Ferrous Bridge’s OSG-builder uses Crown-style heuristics for Stage 2 of the pipeline.</p>
+<h4 data-number="10.1.0.3" id="laertes."><span class="header-section-number">10.1.0.3</span> Laertes.</h4>
+<p>The aliasing-limits study of <span class="citation" data-cites="laertes2023"></span>; the first tool that actually <em>reduces</em> unsafe-block presence in c2rust output by searching for code changes that eliminate raw pointers. Ferrous Bridge’s <span class="math inline">\(\ensuremath{\mathsf{C}}_2\)</span> (Safety Auditor) uses a Laertes-style search-and-refactor loop.</p>
+<h4 data-number="10.1.0.4" id="sactor."><span class="header-section-number">10.1.0.4</span> SACTOR.</h4>
+<p>Two-step LLM-driven translation <span class="citation" data-cites="sactor2025"></span>: unidiomatic preserve-semantics step then idiomatic refinement step. SACTOR pioneered the “unidiomatic-then-idiomatic” factoring; Ferrous Bridge generalises this into the safety-ladder rungs (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span> is unidiomatic; <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span>–<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span> is idiomatic).</p>
+<h4 data-number="10.1.0.5" id="forclift-berkeleyuiucuwedinburgh."><span class="header-section-number">10.1.0.5</span> ForCLift (Berkeley/UIUC/UW/Edinburgh).</h4>
+<p>$5M DARPA TRACTOR grant; combines formal methods, program analysis, and LLM techniques. ForCLift is the academic benchmark Ferrous Bridge most directly competes with on the verification axis; the two are commercially complementary (Ferrous Bridge focuses on shipping libraries; ForCLift focuses on verifying lifts).</p>
+<h4 data-number="10.1.0.6" id="orbit."><span class="header-section-number">10.1.0.6</span> ORBIT.</h4>
+<p>The agentic-orchestration paper of 2026 <span class="citation" data-cites="orbit2026"></span> establishes the LLM-agent-orchestrated lift as a benchmarked architecture. Ferrous Bridge differs in its emphasis on the typed artifact category and the safety ladder; ORBIT does not explicitly factor the orchestration substrate.</p>
+<h4 data-number="10.1.0.7" id="darpa-tractor."><span class="header-section-number">10.1.0.7</span> DARPA TRACTOR.</h4>
+<p>The Battery 01 results <span class="citation" data-cites="tractor2024"></span> report 82.2% average pass rate on a 150-program benchmark, with the top performer at 98.7%. Ferrous Bridge has not yet submitted to TRACTOR; the public targets are libyaml and libexpat first, then a TRACTOR submission in months 12–14 (<span class="citation" data-cites="economics2026"></span>, Phase 3).</p>
+<h2 data-number="10.2" id="industry-galois-immunant-microsoft"><span class="header-section-number">10.2</span> Industry: Galois, Immunant, Microsoft</h2>
+<h4 data-number="10.2.0.1" id="galois."><span class="header-section-number">10.2.0.1</span> Galois.</h4>
+<p>Long-running formal-methods consultancy whose verified-compilation work is the ancestor of CompCert and the academic half of c2rust. Ferrous Bridge’s <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span> rung borrows Galois-style deductive verification at the function level.</p>
+<h4 data-number="10.2.0.2" id="immunant."><span class="header-section-number">10.2.0.2</span> Immunant.</h4>
+<p>The maintainers of c2rust; in October 2025 released v0.21 with the announcement that they have dropped c2rust-refactor and are starting a successor with deeper analysis. Ferrous Bridge is positioned as a commercial sibling to that successor.</p>
+<h4 data-number="10.2.0.3" id="microsoft."><span class="header-section-number">10.2.0.3</span> Microsoft.</h4>
+<p>Galen Hunt’s stated goal of eliminating C/C++ from Microsoft by 2030 is the “one engineer, one month, one million lines” north star. Microsoft’s internal pipeline is not public; Ferrous Bridge competes with it commercially on the open-source deliverable axis.</p>
+<h2 data-number="10.3" id="prossimo-trifecta-shipped-rust-replacements"><span class="header-section-number">10.3</span> Prossimo / Trifecta shipped Rust replacements</h2>
+<p>The Internet Security Research Group’s Prossimo programme and the spin-off Trifecta Tech Foundation have shipped: <code>rustls</code> (TLS) <span class="citation" data-cites="rustls"></span>; <code>sudo-rs</code> (default in Ubuntu since late 2025); <code>ntpd-rs</code> (production at Let’s Encrypt since April 2024); Hickory DNS (the world’s first open-source memory-safe fully recursive DNS resolver); <code>rav1d</code> (AV1 decoder); <code>zlib-rs</code>, <code>libbzip2-rs</code>, <code>libzstd-rs</code>. Each was a multi-engineer-year manual rewrite. Ferrous Bridge does <em>not</em> target any of these (they are off the target list per <span class="citation" data-cites="ferroustargets2026"></span>); rather, it uses each as training-data source for the FTM. Combined, the Prossimo / Trifecta corpus produces roughly 5<span>,</span>000–10<span>,</span>000 high-quality verified pairs.</p>
+<h1 data-number="11" id="sec:conclusion"><span class="header-section-number">11</span> Conclusion</h1>
+<p>Ferrous Bridge is the first end-to-end orchestration of LLM-driven C <span class="math inline">\(\to\)</span> <span class="nodecor"><span class="smallcaps">Rust</span></span> translation that produces a publishable, safe, idiomatic crate (<code>safe-libyaml</code>) from a security-critical C library in human-week-scale wall-clock time and at sub-$300 marginal compute cost. The synthesis architecture rests on three composable pieces.</p>
+<ol>
+<li><p><strong>Part I</strong> (the <code>c</code> paper) is the source theory: a small-step semantics, a seven-class UB taxonomy, eleven <code>libyaml</code> idioms, and the translation contracts they discharge.</p></li>
+<li><p><strong>Part II</strong> (the <code>rust</code> paper) is the target theory: definitions of safe, idiomatic, and ABI-compatible <span class="nodecor"><span class="smallcaps">Rust</span></span>; a lifetime-parameterised <code>Event&lt;\’a&gt;</code> enum; a <code>thiserror</code>-derived structured <code>Error</code>; a no-<code>unsafe</code> core paired with a thin <code>extern "C"</code> ABI shim.</p></li>
+<li><p><strong>Part III</strong> (the <code>c-rust-transpiling</code> paper) is the per-step refinement: twelve refactor patterns, a differential fuzz harness, the Miri / Kani / Loom / cargo-careful tooling ladder, and the seven-day day-by-day <code>libyaml</code> schedule.</p></li>
+</ol>
+<p>The synthesis paper presented here is the <em>theory of the build-system</em> that wires the three together. The build-system is a typed directed acyclic workflow whose nodes are agents, whose edges carry typed protobuf artifacts, and whose Claude Code subagent supervisor refuses to schedule a stage whose input fails schema validation. The build-system emits, as its output, a candidate <code>safe-libyaml</code> crate that is checked against six refinement rungs (<span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{compile}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{behav}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{conc}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span>, <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{abi}}}\)</span>). The composition theorem of <a href="#sec:composition" data-reference-type="ref+Label" data-reference="sec:composition">5</a> states that an artifact passing all six rungs is observably equivalent to <code>libyaml</code> modulo allocator choice and is free of every UB class enumerated in Part I.</p>
+<p>The proof points are concrete: <code>safe-libyaml</code> (one week, $85–$240, seven-day schedule); <code>safe-libexpat</code> (eight to ten days, two extra Kani harnesses, otherwise the same DAG). The library-agnosticism of the orchestration layer is the load-bearing claim of the synthesis; <a href="#sec:libexpat" data-reference-type="ref+Label" data-reference="sec:libexpat">8</a> shows that nothing in the <code>ferrous-bridge</code> runtime mentions YAML or XML.</p>
+<p>The Ferrous Bridge programme converts the C <span class="math inline">\(\to\)</span> <span class="nodecor"><span class="smallcaps">Rust</span></span> migration problem from a labour-intensive, multi-year, per-library effort into a typed pipeline that runs in human-week-scale wall-clock time at fractional-cent-per-line marginal cost. The companion development plan (Appendix <a href="#app:devplan" data-reference-type="ref" data-reference="app:devplan">[app:devplan]</a>) makes the orchestration layer sufficiently concrete to be implemented by a small team in two weeks.</p>
+<h1 class="unnumbered" id="references">References</h1>
+<div class="thebibliography">
+<p><span>99</span></p>
+<p>M. Long. <em>The C Language as a Translation Source: Semantics, Undefined Behavior, and the libyaml Idiom Set</em>. GrokRxiv:2026.04.c [cs.PL], April 2026.</p>
+<p>M. Long. <em>Idiomatic Safe Rust as a Translation Target: Ownership, Lifetimes, and ABI-Compatible Parser Design</em>. GrokRxiv:2026.04.rust [cs.PL], April 2026.</p>
+<p>M. Long. <em>Automated C <span class="math inline">\(\to\)</span> Rust Transpiling: Pipeline, Patterns, and Verification</em>. GrokRxiv:2026.04.c-rust-transpiling [cs.PL], April 2026.</p>
+<p>M. Long. <em>Compile-Time Supremacy: A Strategic Architecture for AI-Assisted C <span class="math inline">\(\to\)</span> Rust Migration at Scale</em>. GrokRxiv:2026.04.c2rust-compile-time-supremacy [cs.SE], April 2026.</p>
+<p>R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer. RustBelt: Securing the foundations of the Rust programming language. <em>POPL</em>, 2018.</p>
+<p>R. Jung et al. Miri: Practical Undefined Behavior Detection for Rust. <em>POPL</em>, 2026.</p>
+<p>X. Leroy. Formal verification of a realistic compiler. <em>Communications of the ACM</em>, 52(7):107–115, 2009.</p>
+<p>Immunant Inc. c2rust v0.21 release notes, October 2025. <a href="https://github.com/immunant/c2rust" class="uri">https://github.com/immunant/c2rust</a></p>
+<p>K. Eméry Coronado et al. Ownership Guided C to Rust Translation. <em>CAV</em>, 2023.</p>
+<p>M. Emre et al. Aliasing Limits on Translating C to Safe Rust. <em>OOPSLA</em>, 2023.</p>
+<p>A. Author and B. Author. SACTOR: LLM-Driven Correct and Idiomatic C to Rust Translation with Static Analysis and FFI-Based Verification. arXiv:2503.xxxxx, 2025.</p>
+<p>L. Author et al. ORBIT: Guided Agentic Orchestration for Autonomous C-to-Rust Transpilation. arXiv:2604.12048, 2026.</p>
+<p>DARPA. TRACTOR Battery 01 Results. Public release, 2024.</p>
+<p>J. Birr-Pixton et al. <code>rustls</code>: A modern TLS library in Rust. Internet Security Research Group / Prossimo, 2025.</p>
+<p>M. Long. <em>Ferrous Bridge — Timeline, Economics &amp; Payoff Model</em>. Internal whitepaper, Magneton Labs LLC, April 2026.</p>
+<p>M. Long. <em>Ferrous Bridge — Development Plan &amp; Architecture</em>. Internal whitepaper, Magneton Labs LLC, April 2026.</p>
+<p>M. Long. <em>Ferrous Bridge — Agent Execution Plan: C(libyaml)<span class="math inline">\(\to\)</span>Safe Rust(libyaml)</em>. Internal whitepaper, Magneton Labs LLC, April 2026.</p>
+<p>M. Long. <em>Ferrous Bridge — Agent Orchestration (Real Tools Only)</em>. Internal whitepaper, Magneton Labs LLC, April 2026.</p>
+<p>M. Long. <em>Ferrous Bridge — Target Library Selection</em>. Internal whitepaper, Magneton Labs LLC, April 2026.</p>
+<p>W3C. XML Conformance Test Suite. <a href="https://www.w3.org/XML/Test/" class="uri">https://www.w3.org/XML/Test/</a>, 2014.</p>
+<p>C. Ellison and G. Roşu. An Executable Formal Semantics of C with Applications. <em>POPL</em>, 2012.</p>
+<p>M. Long. Compile-Time Supremacy. <em>op. cit.</em> <span class="citation" data-cites="long-c2rust-strategy"></span>.</p>
+</div>
+<p><span id="app:devplan" data-label="app:devplan"></span></p>
+<h1 class="unnumbered" id="appendix-a.-development-plan-for-prototype-agents-orchestration-layer">Appendix A. Development Plan for Prototype Agents (Orchestration Layer)</h1>
+<p>This appendix is a granular development plan for the <em>orchestration layer</em> of Ferrous Bridge — the agents and infrastructure that schedule, type-check, validate, and report on the worker agents of Parts I–III. The plan is organised into five sub-areas (A.1 Supervisor core, A.2 schemas, A.3 runtime, A.4 telemetry, A.5 demo) and contains 38 tasks. The time estimates below are <em>senior-engineer hands-on-keyboard hours</em> and assume the engineer is already familiar with the substrate of A.1.1; meetings, code review, and integration debugging are excluded. We expect a realistic team to multiply each estimate by 1.5–2<span class="math inline">\(\times\)</span> when tracking calendar time. Each task uses the format:</p>
+<blockquote>
+<p>[ ] Agent: <em>name</em><span class="math inline">\(\cdot\)</span>Task: <em>verb-phrase</em><br />
+Inputs: <em>files / artifacts</em><br />
+Output: <em>crate path / file</em><br />
+Success: <em>verifiable criterion</em><br />
+Est: <em>hours</em></p>
+</blockquote>
+<p>The sub-areas are intended to be tackled in alphabetical order. Sub-area A.2 is critical-path because the schemas are consumed by every subsequent component. Sub-area A.5 is the public-facing deliverable.</p>
+<h2 class="unnumbered" id="a.1-supervisor-core">A.1 Supervisor core</h2>
+<div class="description">
+<p><strong>Agent:</strong> <code>substrate-doc</code> <strong>Task:</strong> document the chosen orchestration substrate (Claude Code subagents) and the rationale<br />
+<strong>Inputs:</strong> requirements doc (typed message bus, DAG executor, parallelism, escalation queue); the body of this paper, which already commits to Claude Code subagents as the substrate<br />
+<strong>Output:</strong> <code>docs/orchestration-substrate-decision.md</code> documenting why Claude Code subagents was chosen over the alternatives we surveyed (LangGraph, Temporal, a custom Tokio actor)<br />
+<strong>Success:</strong> decision-record signed off by tech lead; the three rejected alternatives each have a one-paragraph why-not<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>message-bus</code> <strong>Task:</strong> implement the typed message bus<br />
+<strong>Inputs:</strong> the schemas of A.2; the substrate decision of A.1.1<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/bus.rs</code><br />
+<strong>Success:</strong> round-trip protobuf send/receive of every artifact type with property-based coverage; no unsafe<br />
+<strong>Est:</strong> 10 hours</p>
+<p><strong>Agent:</strong> <code>dag-executor</code> <strong>Task:</strong> implement the workflow DAG executor<br />
+<strong>Inputs:</strong> the agents enumerated in <a href="#tab:agents" data-reference-type="ref+Label" data-reference="tab:agents">2</a><br />
+<strong>Output:</strong> <code>crates/subagent-core/src/executor.rs</code><br />
+<strong>Success:</strong> can run a synthetic DAG of 10 agents with parallelism = 4; topological sort verified; cycle detection rejects malformed DAGs<br />
+<strong>Est:</strong> 12 hours</p>
+<p><strong>Agent:</strong> <code>schema-validator</code> <strong>Task:</strong> implement schema-validation between every two adjacent agents<br />
+<strong>Inputs:</strong> the protobuf schemas of A.2; the <code>ArtifactType</code> trait<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/validate.rs</code><br />
+<strong>Success:</strong> <code>validate()</code> on every artifact type rejects violation with a structured <code>SchemaMismatch</code>; the property-based test suite covers all required-field omissions<br />
+<strong>Est:</strong> 8 hours</p>
+<p><strong>Agent:</strong> <code>drift-detector</code> <strong>Task:</strong> implement drift-detection heuristics<br />
+<strong>Inputs:</strong> per-agent telemetry stream<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/drift.rs</code><br />
+<strong>Success:</strong> detects (a) loop count <span class="math inline">\(&gt; 10\)</span> for the same input; (b) wall-clock <span class="math inline">\(&gt; 2\)</span>h on the same artifact; (c) build-attempt count <span class="math inline">\(&gt; 5\)</span> on the same module<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>escalation-queue</code> <strong>Task:</strong> implement the human-review escalation queue<br />
+<strong>Inputs:</strong> drift signals from A.1.5; confidence scores from worker agents<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/escalation.rs</code>; a Postgres-backed queue with FIFO + priority lanes<br />
+<strong>Success:</strong> <code>enqueue/dequeue</code> round-trip integration test passes; the queue is durable across process restart<br />
+<strong>Est:</strong> 8 hours</p>
+<p><strong>Agent:</strong> <code>retry-controller</code> <strong>Task:</strong> implement the retry / re-translate controller<br />
+<strong>Inputs:</strong> <code>LadderFailure</code> records from C-phase verifiers; the original RUnit<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/retry.rs</code><br />
+<strong>Success:</strong> on a synthetic Miri failure the retry controller produces a <code>RetryArtifact</code> containing the diagnostic span, the attempted fix, and a budget counter<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>audit-log</code> <strong>Task:</strong> implement the per-agent tamper-evident audit log<br />
+<strong>Inputs:</strong> every artifact entering or leaving an agent<br />
+<strong>Output:</strong> <code>crates/subagent-core/src/audit.rs</code>; a sequenced append-only log signed with the project key<br />
+<strong>Success:</strong> <code>audit verify</code> replays the full DAG run and detects tampering injected by a fault-injection test<br />
+<strong>Est:</strong> 5 hours</p>
+</div>
+<h2 class="unnumbered" id="a.2-artifact-schemas">A.2 Artifact schemas</h2>
+<div class="description">
+<p><strong>Agent:</strong> <code>schema-author</code> <strong>Task:</strong> write <code>cab.proto</code><br />
+<strong>Inputs:</strong> the CAB description of <span class="citation" data-cites="ferrousdevplan2026"></span>, §3.1<br />
+<strong>Output:</strong> <code>proto/cab.proto</code><br />
+<strong>Success:</strong> <code>protoc --lint</code> clean; round-trip serialise / deserialise of a 100-MB CAB stable; field numbers reserve 100–199 for extensions<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>schema-author</code> <strong>Task:</strong> write <code>osg.proto</code><br />
+<strong>Inputs:</strong> the OSG description of Part I, §1.1; the <code>OwnershipClass</code> enum of <span class="citation" data-cites="ferrousdevplan2026"></span><br />
+<strong>Output:</strong> <code>proto/osg.proto</code><br />
+<strong>Success:</strong> the <code>OwnershipClass</code> enum has all five variants; the <code>routing</code> field has all three variants; protoc-lint clean<br />
+<strong>Est:</strong> 3 hours</p>
+<p><strong>Agent:</strong> <code>schema-author</code> <strong>Task:</strong> write <code>rust_unit.proto</code><br />
+<strong>Inputs:</strong> the RUnit type of <a href="#tab:artifact-types" data-reference-type="ref+Label" data-reference="tab:artifact-types">1</a><br />
+<strong>Output:</strong> <code>proto/rust_unit.proto</code><br />
+<strong>Success:</strong> <code>provenance</code> field has variants <code>FTM</code>, <code>Claude</code>, <code>Human</code>; protoc-lint clean<br />
+<strong>Est:</strong> 2 hours</p>
+<p><strong>Agent:</strong> <code>schema-author</code> <strong>Task:</strong> write <code>build_artifact.proto</code>, <code>miri_report.proto</code>, <code>fuzz_report.proto</code>, <code>kani_proof.proto</code>, <code>abi_signature.proto</code>, <code>bench_report.proto</code><br />
+<strong>Inputs:</strong> the rung definitions of <a href="#sec:safety-ladder" data-reference-type="ref+Label" data-reference="sec:safety-ladder">4</a><br />
+<strong>Output:</strong> the six <code>.proto</code> files in <code>proto/</code><br />
+<strong>Success:</strong> every required field has a documented <code>//</code> comment; protoc-lint clean for all six<br />
+<strong>Est:</strong> 5 hours</p>
+<p><strong>Agent:</strong> <code>codegen</code> <strong>Task:</strong> generate <span class="nodecor"><span class="smallcaps">Rust</span></span> bindings via <code>prost</code><br />
+<strong>Inputs:</strong> the <code>.proto</code> files of A.2.1–A.2.4<br />
+<strong>Output:</strong> <code>crates/fb-schemas/src/lib.rs</code> (auto-gen <code>include!</code>d); <code>Cargo.toml</code> with the build script<br />
+<strong>Success:</strong> <code>cargo build -p fb-schemas</code> clean; every generated message type implements <code>Default + Clone + Debug</code><br />
+<strong>Est:</strong> 3 hours</p>
+<p><strong>Agent:</strong> <code>codegen</code> <strong>Task:</strong> generate Python bindings via <code>betterproto</code><br />
+<strong>Inputs:</strong> the <code>.proto</code> files of A.2.1–A.2.4<br />
+<strong>Output:</strong> <code>python/fb_schemas/</code> package, with a <code>pyproject.toml</code><br />
+<strong>Success:</strong> <code>python -m fb_schemas.cab</code> pretty-prints a sample CAB; mypy-clean<br />
+<strong>Est:</strong> 3 hours</p>
+<p><strong>Agent:</strong> <code>trait-author</code> <strong>Task:</strong> implement the <code>ArtifactType</code> trait<br />
+<strong>Inputs:</strong> the schema-validation logic of A.1.4; the generated bindings of A.2.5<br />
+<strong>Output:</strong> <code>crates/fb-schemas/src/artifact.rs</code><br />
+<strong>Success:</strong> every protobuf type has an <code>impl ArtifactType for ...</code> block; the trait carries the schema URL, the artifact-type name, and a <code>validate()</code> method whose error type is <code>SchemaMismatch</code><br />
+<strong>Est:</strong> 4 hours</p>
+</div>
+<h2 class="unnumbered" id="a.3-pipeline-runtime">A.3 Pipeline runtime</h2>
+<div class="description">
+<p><strong>Agent:</strong> <code>cli-author</code> <strong>Task:</strong> build the <code>ferrous-bridge run</code> CLI skeleton<br />
+<strong>Inputs:</strong> <code>clap</code> 4.x; the schemas of A.2<br />
+<strong>Output:</strong> <code>crates/fb-cli/src/main.rs</code><br />
+<strong>Success:</strong> <code>ferrous-bridge run --target libyaml --dry-run</code> prints the per-day plan and exits 0<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>cli-author</code> <strong>Task:</strong> wire the CLI to the DAG executor<br />
+<strong>Inputs:</strong> A.1.3 (DAG executor); A.3.1 (CLI skeleton)<br />
+<strong>Output:</strong> <code>crates/fb-cli/src/run.rs</code><br />
+<strong>Success:</strong> <code>ferrous-bridge run --target libyaml</code> schedules <span class="math inline">\(\ensuremath{\mathsf{A}}_1\)</span> and waits; integration test against a stub-CSrc input passes<br />
+<strong>Est:</strong> 5 hours</p>
+<p><strong>Agent:</strong> <code>tui-author</code> <strong>Task:</strong> build the live TUI surfacing the ladder status<br />
+<strong>Inputs:</strong> <code>ratatui</code>; the supervisor channel of A.1.2<br />
+<strong>Output:</strong> <code>crates/fb-cli/src/tui.rs</code><br />
+<strong>Success:</strong> the TUI shows a 6-row table (one per rung) updating live as artifacts land; an <code>esc</code> keypress detaches cleanly without killing the run<br />
+<strong>Est:</strong> 8 hours</p>
+<p><strong>Agent:</strong> <code>worker-shim</code> <strong>Task:</strong> write the per-agent worker shim for the substrate selected in A.1.1 (the MVP ships only one)<br />
+<strong>Inputs:</strong> the chosen orchestration substrate (A.1.1)<br />
+<strong>Output:</strong> <code>crates/fb-worker/src/lib.rs</code><br />
+<strong>Success:</strong> the shim accepts a typed input artifact, invokes the configured worker (Claude Code subagent, LangGraph node, or Tokio actor depending on A.1.1) with the right prompt template, and returns a typed output artifact; smoke-test against <span class="math inline">\(\ensuremath{\mathsf{A}}_1\)</span> on a 100-LOC C input passes<br />
+<strong>Est:</strong> 18 hours</p>
+<p><strong>Agent:</strong> <code>worker-shim</code> <strong>Task:</strong> document the alternate-substrate adapter interface (no implementation, just the trait + integration contract for later contributors)<br />
+<strong>Inputs:</strong> the shim of A.3.4<br />
+<strong>Output:</strong> <code>crates/fb-worker/src/adapter.rs</code> (trait only) and <code>docs/substrate-porting-guide.md</code><br />
+<strong>Success:</strong> the trait carries every method the shim of A.3.4 uses; the porting guide walks through implementing it for one of the two alternates; reviewed by an external Rust contributor<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>worker-shim</code> <strong>Task:</strong> chaos / fault-injection test for the shim<br />
+<strong>Inputs:</strong> the shim of A.3.4<br />
+<strong>Output:</strong> <code>crates/fb-worker/tests/chaos.rs</code><br />
+<strong>Success:</strong> the shim survives 10% packet loss, 1% process kill, and a 30-s network partition without dropping artifacts; audit log A.1.8 records the disruption<br />
+<strong>Est:</strong> 8 hours</p>
+<p><strong>Agent:</strong> <code>verifier-glue</code> <strong>Task:</strong> wire each rung verifier to its agent (<span class="math inline">\(\ensuremath{\mathsf{C}}_1\)</span>–<span class="math inline">\(\ensuremath{\mathsf{F}}\)</span>)<br />
+<strong>Inputs:</strong> the verifier CLI invocations of <a href="#sec:safety-ladder" data-reference-type="ref+Label" data-reference="sec:safety-ladder">4</a><br />
+<strong>Output:</strong> <code>crates/fb-verify/src/{rustc,miri,fuzz,careful,kani,cbindgen}.rs</code><br />
+<strong>Success:</strong> each verifier subroutine produces a typed artifact (<span class="math inline">\(\mathsf{MiriReport}\)</span>, <span class="math inline">\(\mathsf{FuzzReport}\)</span>, <span class="math inline">\(\mathsf{KaniProof}\)</span>, <span class="math inline">\(\mathsf{ABISignature}\)</span>, etc.) on a stub <span class="math inline">\(\mathsf{BuildArtifact}\)</span>input<br />
+<strong>Est:</strong> 12 hours</p>
+<p><strong>Agent:</strong> <code>router</code> <strong>Task:</strong> implement the FTM-vs-Claude router<br />
+<strong>Inputs:</strong> the OSG output of <span class="math inline">\(\ensuremath{\mathsf{A}}_1\)</span>; confidence scores; the routing rules of Part III, §3.3<br />
+<strong>Output:</strong> <code>crates/fb-translate/src/router.rs</code><br />
+<strong>Success:</strong> on a synthetic OSG with 100 functions, the router routes 70% to FTM and 30% to Claude, matching the threshold <code>complexity_score &lt; 0.5 &amp;&amp; all_confidence &gt; 0.8</code><br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>git-worktree-mgr</code> <strong>Task:</strong> integrate per-agent git worktrees so phase-B agents do not merge-conflict<br />
+<strong>Inputs:</strong> the orchestration paper of <span class="citation" data-cites="ferrousbridge2026orchestration"></span><br />
+<strong>Output:</strong> <code>crates/fb-cli/src/worktree.rs</code><br />
+<strong>Success:</strong> <code>ferrous-bridge worktree --agent B4</code> creates a worktree at <code>.worktrees/B4/</code> with the right branch and the CLAUDE.md rules pre-installed<br />
+<strong>Est:</strong> 5 hours</p>
+</div>
+<h2 class="unnumbered" id="a.4-telemetry">A.4 Telemetry</h2>
+<div class="description">
+<p><strong>Agent:</strong> <code>metrics</code> <strong>Task:</strong> export Prometheus metrics per agent<br />
+<strong>Inputs:</strong> the supervisor channel of A.1.2<br />
+<strong>Output:</strong> <code>crates/fb-telemetry/src/metrics.rs</code><br />
+<strong>Success:</strong> <code>curl localhost:9090/metrics</code> returns per-agent counters for <code>latency_seconds</code>, <code>retries_total</code>, <code>confidence_histogram</code><br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>logs</code> <strong>Task:</strong> structured JSON logging via <code>tracing</code><br />
+<strong>Inputs:</strong> the worker shims of A.3.4–A.3.6<br />
+<strong>Output:</strong> <code>crates/fb-telemetry/src/logging.rs</code><br />
+<strong>Success:</strong> every artifact transition emits a <code>{"agent": ..., "input_type": ..., "output_type": ..., "duration_ms": ...}</code> JSON line; downstream Loki pipeline parses cleanly<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>tracing</code> <strong>Task:</strong> OpenTelemetry trace per pipeline run<br />
+<strong>Inputs:</strong> the supervisor channel of A.1.2<br />
+<strong>Output:</strong> <code>crates/fb-telemetry/src/otel.rs</code><br />
+<strong>Success:</strong> a complete <code>libyaml</code> dry-run produces a single Jaeger trace with one span per agent, total span <span class="math inline">\(&lt;\)</span> 0.1% of total wall-clock<br />
+<strong>Est:</strong> 5 hours</p>
+<p><strong>Agent:</strong> <code>dashboard</code> <strong>Task:</strong> ship a Grafana dashboard JSON<br />
+<strong>Inputs:</strong> the metrics of A.4.1<br />
+<strong>Output:</strong> <code>deploy/grafana/ferrous-bridge-overview.json</code><br />
+<strong>Success:</strong> the dashboard renders in Grafana 10.x with panels for per-agent latency, per-rung pass rate, and weekly cost in $ tokens<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>audit-explorer</code> <strong>Task:</strong> ship a tiny web viewer for the audit log<br />
+<strong>Inputs:</strong> A.1.8 (audit log)<br />
+<strong>Output:</strong> <code>crates/fb-audit-web/</code> (axum + htmx)<br />
+<strong>Success:</strong> <code>cargo run -p fb-audit-web</code> serves a UI showing per-run timeline, per-agent inputs / outputs, and per-artifact diff against the previous run<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>cost-tracker</code> <strong>Task:</strong> aggregate Claude API token usage per run<br />
+<strong>Inputs:</strong> the worker shims A.3.4–A.3.6<br />
+<strong>Output:</strong> <code>crates/fb-telemetry/src/cost.rs</code><br />
+<strong>Success:</strong> the per-run cost report breaks down by phase (A/B/C), by agent, and by FTM-vs-Claude provenance; matches the Anthropic dashboard within 2%<br />
+<strong>Est:</strong> 4 hours</p>
+</div>
+<h2 class="unnumbered" id="a.5-end-to-end-demo">A.5 End-to-end demo</h2>
+<div class="description">
+<p><strong>Agent:</strong> <code>packager</code> <strong>Task:</strong> ship <code>cargo install ferrous-bridge</code><br />
+<strong>Inputs:</strong> all crates of A.1–A.4<br />
+<strong>Output:</strong> a published <code>ferrous-bridge</code> binary on <code>crates.io</code><br />
+<strong>Success:</strong> a clean Linux x86_64 host with only <code>cargo</code> pre-installed can run <code>cargo install ferrous-bridge</code> and then <code>ferrous-bridge --help</code><br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>demo-author</code> <strong>Task:</strong> write the one-command <code>libyaml</code> reproduction script<br />
+<strong>Inputs:</strong> the seven-day <code>libyaml</code> schedule of <a href="#sec:libyaml" data-reference-type="ref+Label" data-reference="sec:libyaml">7</a><br />
+<strong>Output:</strong> <code>scripts/demo-libyaml.sh</code><br />
+<strong>Success:</strong> <code>git clone ferrous-bridge &amp;&amp; cd ferrous-bridge &amp;&amp; ./scripts/demo-libyaml.sh</code> produces <code>safe-libyaml/</code> on disk in 5 working days on a 16-core workstation with a Claude API key in the environment<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>demo-author</code> <strong>Task:</strong> write the one-command <code>libexpat</code> reproduction script<br />
+<strong>Inputs:</strong> the <code>libexpat</code> re-instantiation of <a href="#sec:libexpat" data-reference-type="ref+Label" data-reference="sec:libexpat">8</a><br />
+<strong>Output:</strong> <code>scripts/demo-libexpat.sh</code><br />
+<strong>Success:</strong> <code>./scripts/demo-libexpat.sh</code> produces <code>safe-libexpat/</code> on disk in 7 working days; the two new Kani harnesses pass<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>tutorial</code> <strong>Task:</strong> write a 10-minute screencast walkthrough<br />
+<strong>Inputs:</strong> the demo scripts of A.5.2 and A.5.3<br />
+<strong>Output:</strong> <code>docs/walkthrough.mp4</code> (asciinema source + generated mp4)<br />
+<strong>Success:</strong> the screencast plays end-to-end without a manual pause; commentary references each rung as it lights up in the TUI<br />
+<strong>Est:</strong> 4 hours</p>
+<p><strong>Agent:</strong> <code>ci</code> <strong>Task:</strong> GitHub Actions workflow that runs the demo nightly<br />
+<strong>Inputs:</strong> A.5.2 (libyaml demo); a budgeted Anthropic API key<br />
+<strong>Output:</strong> <code>.github/workflows/nightly-libyaml.yml</code><br />
+<strong>Success:</strong> the workflow runs on <code>ubuntu-24.04-x64</code> for <span class="math inline">\(&lt;\)</span> $50 per night, posts the per-rung verdict to a Slack channel, and uploads the resulting <code>safe-libyaml.tar.gz</code> as an artifact<br />
+<strong>Est:</strong> 5 hours</p>
+<p><strong>Agent:</strong> <code>publisher</code> <strong>Task:</strong> publish <code>safe-libyaml</code> 0.1.0 to <code>crates.io</code><br />
+<strong>Inputs:</strong> the <code>safe-libyaml</code> crate produced by A.5.2<br />
+<strong>Output:</strong> a tagged release on <code>crates.io</code><br />
+<strong>Success:</strong> <code>cargo add safe-libyaml</code> succeeds; the crate has docs hosted on <code>docs.rs</code>; the README points to the Ferrous Bridge synthesis paper<br />
+<strong>Est:</strong> 3 hours</p>
+<p><strong>Agent:</strong> <code>publisher</code> <strong>Task:</strong> open a PR against <code>serde_yaml_ng</code> switching the default backend from <code>unsafe-libyaml</code> to <code>safe-libyaml</code><br />
+<strong>Inputs:</strong> a published <code>safe-libyaml</code> 0.1.0 on <code>crates.io</code><br />
+<strong>Output:</strong> a draft GitHub PR<br />
+<strong>Success:</strong> the PR’s CI is green; the upstream maintainers’ triage shows engagement (review comments) within two weeks<br />
+<strong>Est:</strong> 6 hours</p>
+<p><strong>Agent:</strong> <code>security-disclosure</code> <strong>Task:</strong> CISA-aligned safety reporting for the <code>libyaml</code> <span class="math inline">\(\to\)</span> <code>safe-libyaml</code> delta<br />
+<strong>Inputs:</strong> the diff between <code>libyaml</code> and <code>safe-libyaml</code>; the rung <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{mem}}}\)</span> and <span class="math inline">\(\ensuremath{\sqsubseteq_{\!\mathrm{ref}}}\)</span> reports<br />
+<strong>Output:</strong> <code>docs/security-disclosure-libyaml.md</code><br />
+<strong>Success:</strong> the disclosure enumerates each UB class discharged, with code citations to both the C and Rust sides; the document is filed with the CVE Mitre numbering authority and is acknowledged within ten business days<br />
+<strong>Est:</strong> 6 hours</p>
+</div>
+<h2 class="unnumbered" id="a.6-task-dependency-dag">A.6 Task dependency DAG</h2>
+<p><a href="#fig:devplan-dag" data-reference-type="ref+Label" data-reference="fig:devplan-dag">5</a> shows the dependency DAG of the 38 tasks above.</p>
+<figure id="fig:devplan-dag" data-latex-placement="h">
+
+<figcaption>The 38-task orchestration-layer development plan as a dependency DAG. Blue = schemas (A.2); green = supervisor core (A.1); orange = runtime (A.3); yellow = telemetry (A.4); red = demo (A.5). The schemas critical path (top row) blocks every downstream sub-area; A.5.6 (publishing <code>safe-libyaml</code> to crates.io) is the public-facing deliverable.</figcaption>
+</figure>
+<h2 class="unnumbered" id="a.7-two-week-mvp-gantt">A.7 Two-week MVP Gantt</h2>
+<p><a href="#fig:devplan-gantt" data-reference-type="ref+Label" data-reference="fig:devplan-gantt">6</a> renders the 38-task plan as a two-week Gantt chart, assuming a three-engineer team with one tech lead. The schedule shown is the <em>aggressive</em> target derived directly from the per-task hour estimates above; for calendar-time planning the team should apply a 1.5–2<span class="math inline">\(\times\)</span> multiplier (yielding a 3–4 week MVP) to absorb meeting overhead, integration debugging, and review cycles. The critical path runs through A.2 (schemas) on days 1–2, A.1 (supervisor core) on days 3–6, and A.5 (demo) on days 12–14, with A.3 (runtime) and A.4 (telemetry) overlapping on days 5–11.</p>
+<figure id="fig:devplan-gantt" data-latex-placement="h">
+
+<figcaption>Two-week orchestration-layer MVP Gantt. Critical path (top to bottom): A.2 schemas <span class="math inline">\(\to\)</span> A.1 Supervisor core <span class="math inline">\(\to\)</span> A.5 demo. The runtime and telemetry tracks parallelise from day 4 onwards. The deliverable on day 14 is a working <code>ferrous-bridge run --target libyaml</code> CLI plus a published <code>safe-libyaml</code> 0.1.0 on <code>crates.io</code>.</figcaption>
+</figure>

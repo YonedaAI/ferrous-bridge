@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+
+# Vercel
+.vercel/
+.vercel-url
+
+# Node / Next.js
+website/node_modules/
+website/.next/
+website/.vercel/
+website/out/
+
+# LaTeX build artifacts (only PDFs and TeX should be committed)
+papers/latex/*.aux
+papers/latex/*.log
+papers/latex/*.toc
+papers/latex/*.out
+papers/latex/*.bbl
+papers/latex/*.blg
+papers/latex/*.fls
+papers/latex/*.fdb_latexmk
+papers/latex/*.synctex.gz
+papers/latex/*.lof
+papers/latex/*.lot
+papers/latex/*.nav
+papers/latex/*.snm
+papers/latex/*.vrb
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.claude/

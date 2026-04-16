@@ -1,0 +1,29 @@
+{
+  "name": "ferrous-bridge",
+  "domain": "systems software / programming languages / safety engineering",
+  "aesthetic": "industrial — molten ferrous metal, bridge truss steel, blueprint grid",
+  "colors": {
+    "--bg": "#0d0f12",
+    "--surface": "#161a20",
+    "--surface-hover": "#1e242c",
+    "--accent": "#d2552c",
+    "--accent-hover": "#ec6b3f",
+    "--accent-glow": "rgba(210, 85, 44, 0.18)",
+    "--accent-secondary": "#6fa8dc",
+    "--text": "#e8ecef",
+    "--text-muted": "#9aa3ad",
+    "--text-dim": "#5b6470",
+    "--border": "#242a32",
+    "--code-bg": "#0a0b0e",
+    "--success": "#7bb572",
+    "--warning": "#e0a14a"
+  },
+  "fonts": {
+    "body": "Inter",
+    "mono": "JetBrains Mono",
+    "heading": "Crimson Pro"
+  },
+  "hero": "dark background with SVG bridge-truss pattern (diagonal cross-bracing) at low opacity",
+  "cardEffect": "rust-glow box-shadow on hover using --accent-glow, scale 1.02",
+  "notes": "accent-secondary blueprint blue reserved for code/inline-math borders"
+}
