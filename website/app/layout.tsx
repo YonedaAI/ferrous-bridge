@@ -1,4 +1,4 @@
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import { Inter, JetBrains_Mono, Crimson_Pro } from 'next/font/google';
 import 'katex/dist/katex.min.css';
 import './globals.css';
@@ -26,6 +26,12 @@ const crimsonPro = Crimson_Pro({
 const siteUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL
   ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
   : process.env.NEXT_PUBLIC_SITE_URL || 'https://ferrous-bridge.vercel.app';
+
+export const viewport: Viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  viewportFit: 'cover',
+};
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),

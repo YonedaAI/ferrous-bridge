@@ -13,6 +13,14 @@ function loadMacros(): Record<string, string> {
     '\\ensuremath': '#1',
     // \xspace exists in xspace.sty — passthrough.
     '\\xspace': '',
+    // Text-mode commands KaTeX doesn't ship: route them through \text so
+    // they render as upright text rather than red error tokens. Used by
+    // the project macros \rust = \textnormal{\textsc{Rust}} and
+    // \clang = \textnormal{\textsc{C}}, plus any inline \textsc / \textnormal
+    // pandoc may emit. (KaTeX has no small-caps; we render upright Roman.)
+    '\\textnormal': '\\text{#1}',
+    '\\textsc': '\\text{#1}',
+    '\\textsf': '\\text{#1}',
   };
 
   try {
@@ -60,17 +68,17 @@ function renderTeX(tex: string, displayMode: boolean): string {
 export function renderMath(html: string): string {
   let result = html;
 
-  // Replace display math: \[...\]
+  // Pandoc with --mathjax always emits math as \(...\) (inline) or \[...\]
+  // (display). We deliberately do NOT match $...$ or $$...$$ here: those
+  // delimiter forms are never produced by our pandoc invocation, and matching
+  // them would catch literal currency dollar signs (e.g. "$85--240") that
+  // pandoc emits when the LaTeX source uses \$ for a real dollar character.
+
+  // Display math: \[...\]
   result = result.replace(/\\\[([\s\S]*?)\\\]/g, (_, tex) => renderTeX(tex, true));
 
-  // Replace display math: $$...$$
-  result = result.replace(/\$\$([\s\S]*?)\$\$/g, (_, tex) => renderTeX(tex, true));
-
-  // Replace inline math: \(...\)
+  // Inline math: \(...\)
   result = result.replace(/\\\(([\s\S]*?)\\\)/g, (_, tex) => renderTeX(tex, false));
-
-  // Replace inline math: $...$ (single dollar, non-greedy, no newlines)
-  result = result.replace(/(?<![\\$])\$([^$\n]+?)\$(?!\$)/g, (_, tex) => renderTeX(tex, false));
 
   return result;
 }
